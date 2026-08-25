@@ -1,0 +1,244 @@
+1. **Hypothesis**
+
+Najbardziej prawdopodobny następny punkt awarii w `0x65FC` to **pierwszy status-returning `call` wykonywany po potwierdzonym checku `RBX != 0`, wraz z bezpośrednim `EFI_ERROR(Status)` / `test rax,rax ; js ...` prowadzącym do wspólnego bloku `EFI_DEVICE_ERROR`**.
+
+Robocza hipoteza dla Cycle 234:
+
+> `0x65FC` poprawnie uzyskuje 64-bitową wartość z `+0x108/+0x10C`, ale następna operacja wykonywana z użyciem tej wartości — najpewniej programowanie/walidacja zasobu portu lub operacja DMA/MMIO — zwraca status błędny albo nie spełnia kolejnego warunku. `0x65FC` następnie lokalnie konwertuje ten przypadek na `EFI_DEVICE_ERROR`.
+
+Nie proponowałbym jeszcze bypassu samego `EFI_DEVICE_ERROR`. Najpierw trzeba rozstrzygnąć **czy źródłem jest następny `call`, czy lokalny `cmp/test` po nim**.
+
+---
+
+2. **Most likely BIOS area / function**
+
+Obszar pozostaje bardzo wąski:
+
+```text
+AHCI.Start()
+  └─ 0x2078
+       └─ 0x65FC
+            ├─ load +0x108/+0x10C
+            ├─ compose 64-bit value → RBX
+            ├─ RBX == 0 ? EFI_DEVICE_ERROR   ← V156: NIE
+            │
+            └─ NEXT BASIC BLOCK             ← cel Cycle 234
+                 ├─ call X
+                 ├─ test/cmp result
+                 └─ branch → error
+```
+
+Szczególnie interesujący jest **pierwszy `call` dominowany przez blok `RBX != 0`**, jeżeli po nim występuje jeden z typowych wzorców:
+
+```asm
+call    sub_xxxx
+test    rax, rax
+js      error
+```
+
+lub:
+
+```asm
+call    sub_xxxx
+cmp     eax, 0
+jne     error
+```
+
+albo lokalna walidacja wartości/adresu:
+
+```asm
+test/cmp rbx, ...
+jcc      device_error
+```
+
+Nie wracałbym na tym etapie ani do Apriori, ani do DEPEX, ani do `0x2078`.
+
+---
+
+3. **Candidate edit or instrumentation**
+
+### Proponowany V157 / Cycle 234 patch
+
+Zamiast instrumentować dopiero exit `0x65FC`, wstawić **dwa rozróżnialne markery wokół pierwszego istotnego `call` po checku RBX**:
+
+```text
+marker A → bezpośrednio przed CALL
+CALL
+marker/status probe B → bezpośrednio po CALL, przed EFI_ERROR/test/cmp
+```
+
+Najlepszy wariant diagnostyczny to nie tylko marker obecności, lecz sklasyfikowanie `RAX`:
+
+```text
+RAX == EFI_SUCCESS       → marker B0
+RAX has EFI_ERROR bit    → marker B1
+```
+
+Jeżeli bezpiecznie mieści się patch, dodatkowo trzeci marker:
+
+```text
+marker C → taken error branch po test/cmp
+```
+
+Czyli logicznie:
+
+```asm
+; RBX != 0 confirmed
+
+POST A
+call    next_helper
+
+; preserve RAX
+test    rax, rax
+js      status_error_marker
+
+POST B
+; original flow
+...
+```
+
+**Nie zmieniałbym jeszcze wyniku `call` na `EFI_SUCCESS`.**
+
+Jeżeli okaże się, że między `RBX` checkiem a error blockiem **nie ma żadnego calla**, analogicznie instrumentować pierwszy następny `cmp/test` oraz obie strony jego conditional branch.
+
+---
+
+4. **Why this is plausible**
+
+V155 i V156 mocno zmieniły priorytety hipotez:
+
+```text
+V155:
+0x65FC → EFI_DEVICE_ERROR
+
+V156:
+(+0x10C << 32) | +0x108 != 0
+```
+
+Zatem wcześniejszy model:
+
+```text
+missing/null resource
+→ RBX == 0
+→ local EFI_DEVICE_ERROR
+```
+
+jest już empirycznie odrzucony.
+
+Najbardziej prawdopodobna klasa błędu przesuwa się więc o jeden basic block dalej:
+
+```text
+resource exists
+        ↓
+resource is consumed / programmed / validated
+        ↓
+operation fails
+        ↓
+EFI_DEVICE_ERROR
+```
+
+To jest znacznie bardziej prawdopodobne niż powrót do dispatchu AHCI, ponieważ mamy już jednoznaczny ciąg wykonania:
+
+```text
+SataController OK
+AHCI dispatched
+AHCI.Start entered
+0x2078 entered
+0x65FC entered
+RBX resource exists
+0x65FC returns error
+```
+
+Innymi słowy: teraz szukamy **semantycznej niezgodności zasobu Raven Ridge**, a nie braku wykonania modułu.
+
+---
+
+5. **Expected POST behavior if correct**
+
+Przy samej instrumentacji oczekuję jednego z dwóch rozstrzygających wyników.
+
+### Wariant A — podrzędny `call` jest źródłem
+
+```text
+marker-before-call
+→ marker indicating EFI_ERROR
+→ 07
+```
+
+To oznacza:
+
+> `0x65FC` nie tworzy błędu samodzielnie w następnym warunku; propaguje lub mapuje failure zwrócony przez niższą funkcję.
+
+Następny cykl schodzi wtedy **do tego konkretnego helpera**.
+
+### Wariant B — `call` wraca sukcesem
+
+```text
+marker-before-call
+→ SUCCESS marker
+→ 07
+```
+
+Wtedy blockerem jest kolejny lokalny:
+
+```asm
+cmp/test
+jcc error
+```
+
+i następny build powinien instrumentować **wartości operandów tego właśnie compare**.
+
+Jeśli późniejszy eksperymentalny bypass właściwego warunku okaże się poprawny, oczekujemy odejścia od:
+
+```text
+07
+```
+
+i pojawienia się **nowego, późniejszego POST code / następnego markera AHCI**, niekoniecznie od razu pełnego POST.
+
+---
+
+6. **What would falsify this**
+
+Hipoteza o „następnym status-returning callu” zostaje obalona, jeśli:
+
+* pierwszy `call` po `RBX != 0` zwróci jednoznacznie `EFI_SUCCESS`,
+* wszystkie kolejne status-returning calle do momentu error exit również zwrócą sukces,
+* albo control flow ominie przewidywany `EFI_ERROR` branch, a mimo tego `0x65FC` zakończy się `EFI_DEVICE_ERROR`.
+
+Wtedy należy szukać **lokalnego compare**, np.:
+
+```text
+alignment
+range
+capability bit
+port state
+register readback
+mask != expected
+```
+
+Jeżeli natomiast marker przed następnym blokiem w ogóle się nie pojawi, falsyfikuje to nasze obecne rozumienie CFG — istnieje wcześniejsza ścieżka z `RBX != 0` bezpośrednio do error exit.
+
+---
+
+7. **Minimal next validation steps**
+
+8. W `0x65FC` znaleźć **pierwszy conditional branch po potwierdzonym `RBX != 0`**, ze szczególnym uwzględnieniem pierwszego `call`.
+
+9. Zbudować Cycle 234 tak, aby rozróżniał tylko trzy stany:
+
+```text
+A = osiągnięto następny basic block
+B = następny CALL zwrócił EFI_SUCCESS
+C = następny CALL zwrócił EFI_ERROR
+```
+
+3. Nie bypassować jeszcze błędu.
+4. Jeżeli wynik to `C → 07`, następny cel to **callee tego jednego calla**.
+5. Jeżeli wynik to `B → 07`, instrumentować **pierwszy `cmp/test + jcc` za nim**, zapisując/oznaczając obie gałęzie.
+
+### Rekomendacja do następnego BIOS-u
+
+**Cycle 234 powinien być czystym discriminator buildem dla pierwszego basic blocku po `RBX != 0`, a nie kolejnym funkcjonalnym patchem.**
+
+Mamy już na tyle wąski failure cone, że jeden dobrze umieszczony probe powinien rozstrzygnąć, czy schodzimy **do następnego helpera**, czy zostajemy **w lokalnej logice `0x65FC`**.

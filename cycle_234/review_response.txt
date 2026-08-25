@@ -1,0 +1,44 @@
+## Recenzja niezależnego reviewera BIOS — Cycle 234 (dyskryminator basic-block w 0x65FC)
+
+### 1. Major concerns
+
+- **Cała hipoteza zakłada konkretny kształt CFG (call → test rax,rax/js → error), którego nikt jeszcze nie potwierdził dekompilacją.** Dokument sam przyznaje "nie wiemy, czy jest call, czy cmp/test" — a mimo to proponowany patch (marker A/B/C wokół "pierwszego calla") zakłada z góry, że call istnieje i że jest pierwszym elementem w kolejnym basic blocku. Jeśli następny blok zaczyna się od `cmp`/`test`/`lea`/dostępu do pamięci bez wywołania funkcji, marker A trafi w złe miejsce lub w ogóle się nie skompiluje sensownie względem rzeczywistego kodu.
+- **Założenie konwencji wywołania x64 (RAX = status) nie zostało zweryfikowane dla tego konkretnego calla.** To może być helper zwracający BOOLEAN, wskaźnik, czy coś, co tylko przypadkiem mieści się w EAX/RAX z ustawionym bitem znaku — patch "test rax,rax; js error" jako założenie interpretacyjne jest ryzykowny, bo `js` (sign flag) niekoniecznie odpowiada konwencji `EFI_ERROR()` (najwyższy bit 64-bit), a instrumentacja może błędnie klasyfikować B/C.
+- **"Preserve RAX" w kodzie patcha jest niebezpieczne bez znajomości pełnego ABI tej funkcji.** Jeśli oryginalny kod używa RAX/RCX/RDX/R8-R11 jako scratch zaraz po callu (typowe dla MSVC-skompilowanego AMI/EDK2 binarnego kodu), wstrzyknięcie dodatkowych instrukcji (POST out + test + conditional jump) między `call` a właściwym użyciem wyniku może nadpisać flagi (RFLAGS) lub rejestry, których dalszy kod się spodziewa nietkniętych. To nie jest tylko ryzyko teoretyczne — to dokładnie ten typ overbroad/side-effect change, przed którym trzeba ostrzec.
+- **Brak dowodu, że "pierwszy call po RBX != 0" jest w ogóle na ścieżce prowadzącej do EFI_DEVICE_ERROR.** Mogą istnieć dwa lub więcej rozłącznych bloków między potwierdzonym warunkiem `RBX != 0` a punktem zwrotu błędu (np. dodatkowe early-exit na innych warunkach, pętla retry, kilka niezależnych walidacji). Zakładanie liniowej sekwencji "RBX!=0 → call → test → error" jest uproszczeniem, które może pominąć rozgałęzienia.
+
+### 2. Missing evidence
+
+- Brak jakiejkolwiek dekompilacji/disasemblacji 0x65FC pokazującej rzeczywisty basic block bezpośrednio po skoku warunkowym `RBX == 0`. Cały plan Cycle 234 jest budowany na spekulacji o kształcie kodu, nie na jego treści.
+- Brak potwierdzenia liczby instrukcji/bloków między `RBX != 0` a `ret EFI_DEVICE_ERROR` — czy to jeden blok, czy pięć.
+- Brak informacji, czy funkcja w ogóle zawiera jakikolwiek `call` przed error exitem, czy błąd powstaje wyłącznie z lokalnych porównań (co dokument sam dopuszcza jako "Wariant B", ale i tak proponuje zacząć od instrumentacji calla).
+- Brak analizy, czy 0x65FC ma więcej niż jedną ścieżkę zwrotu `EFI_DEVICE_ERROR` (możliwość, którą podniosłem w poprzedniej recenzji, wciąż nieadresowana).
+- Brak weryfikacji stanu rejestrów HBA (GHC/CAP/PI/BOH) w tym punkcie — nadal nieobecna z poprzedniej rundy, a to wciąż jedna z najbardziej prawdopodobnych przyczyn niepowodzenia "resource consumed/programmed" na etapie post-RBX.
+- Brak potwierdzenia, że +0x108/+0x10C w ogóle reprezentuje "zasób" (np. adres BAR/MMIO), a nie coś, co tylko przypadkowo jest niezerowe (poison/heap garbage — ryzyko podniesione poprzednio i wciąż nierozstrzygnięte).
+
+### 3. Alternative hypotheses
+
+- **Błąd może w ogóle nie być w następnym basic blocku po RBX-check, lecz w oddzielnej wcześniejszej gałęzi, która scala się (merge point) z tą, którą testujemy** — tj. `RBX != 0` mogło nie być jedynym warunkiem prowadzącym do tego samego error exitu; instrumentacja jednej gałęzi nie wyklucza równoległej.
+- **Możliwe, że kolejny "call" to nie funkcja walidująca zasób, lecz coś w rodzaju `gBS->WaitForEvent`/`Stall`/pollowanie timera**, którego niepowodzenie wynika z wcześniej zdiagnozowanych problemów projektu z Timer Arch Protocol / niekompletnym CPU_ARCH chain — czyli powrót do już znanego ryzyka projektu, a nie nowa "semantyczna niezgodność zasobu Raven Ridge".
+- **+0x108/+0x10C mogą być niepowiązane z faktycznym parametrem calla** — dokument zakłada, że "RBX skomponowane z tych pól" jest przekazywane do następnej funkcji, ale nie ma dowodu, że RBX w ogóle jest argumentem calla (może być użyte tylko do lokalnego warunku, a call operuje na zupełnie innych rejestrach/strukturze).
+- **Alternatywnie, błąd może wynikać z nieprawidłowego mapowania MMIO/BAR wcześniej w łańcuchu PciRootBridge/PciBus (F10 donor)** — spójne z udokumentowaną w projekcie historią problemów z RootBridgeIO/PCI_IO. To nadal nie zostało wykluczone i jest tańsze do zweryfikowania niż drążenie kolejnych basic bloków 0x65FC.
+
+### 4. Safer alternative edits or instrumentation
+
+- Zanim wstawi się jakikolwiek patch oparty na założeniu "call → test rax,rax → js", **wykonać czystą dekompilację/dysasemblację bloku bezpośrednio po `RBX != 0`** (nawet ręczną, offline) i dopiero na tej podstawie projektować markery — nie zgadywać kształtu kodu.
+- Jeśli dekompilacja nie jest możliwa w tym cyklu, **ograniczyć patch do jednego markera "reached next block" bez żadnej próby klasyfikacji RAX/branch**, żeby zweryfikować samo dotarcie do tego miejsca bez ryzyka zaburzenia rejestrów/flag przed nieznaną instrukcją.
+- Unikać wstawiania `test rax, rax` / warunkowego skoku w kodzie instrumentacyjnym, dopóki nie wiadomo, że RAX rzeczywiście niesie status — zamiast tego zrzucić surową wartość RAX (lub kilku rejestrów) do POST port w formie rozbitej na bajty, bez interpretacji.
+- Zachować oryginalne flagi/rejestry nietknięte tak długo, jak to możliwe — jeśli trzeba użyć POST out (zwykle przez port I/O, co nadpisuje AL i potencjalnie flagi), zapisać i odtworzyć pełny kontekst (`pushfq`/`push rax` itd.) wokół instrumentacji, nie tylko RAX.
+- Równolegle (tańszy, niezależny eksperyment) zweryfikować stan rejestrów HBA i mapowania BAR w tym punkcie — to może rozstrzygnąć hipotezę alternatywną bez dalszego drążenia w głąb 0x65FC.
+
+### 5. Minimal validation plan before next flash
+
+1. Uzyskać realną dekompilację bloku po `RBX != 0` (choćby częściową) — warunek konieczny przed zaprojektowaniem precyzyjnego patcha.
+2. Jeśli niedostępna: build z **jednym** markerem "reached-next-block", zero interpretacji RAX, zero conditional logic w patchu.
+3. Dopiero po potwierdzeniu, że blok jest osiągany i że jest tam faktycznie `call`, zaprojektować wariant z klasyfikacją sukces/błąd — i to z zachowaniem pełnego kontekstu rejestrów/flag.
+4. Równolegle zebrać zrzut rejestrów HBA (GHC/CAP/PI) w tym punkcie jako niezależną ścieżkę weryfikacji.
+5. Nie łączyć instrumentacji z żadnym bypassem błędu w tym samym buildzie — Cycle 234 ma pozostać czysto diagnostyczny, zgodnie z własną deklaracją dokumentu.
+
+### 6. Final verdict
+
+**Need more evidence — odrzucam projekt patcha w obecnej formie.** Plan zakłada nieznany kształt kodu (call + test rax,rax + js) bez dekompilacji, ryzykuje naruszenie rejestrów/flag nieznaną instrumentacją, i nie wyklucza alternatywnych hipotez (wielościeżkowy error exit, problem z BAR/MMIO wcześniej w łańcuchu). Rekomenduję najpierw dekompilację lub minimalny, bezinterpretacyjny marker "reached next block", zanim powstanie jakikolwiek patch klasyfikujący RAX.

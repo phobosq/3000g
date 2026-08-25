@@ -1,0 +1,152 @@
+{
+  "cycle_no": 234,
+  "project_name": "Athlon 3000G na ASRock X570 Taichi",
+  "status_date": "2026-08-24",
+  "board": {
+    "manufacturer": "ASRock",
+    "model": "X570 Taichi",
+    "bios_target_version": "2.70",
+    "donor_reference": {
+      "board": "ASRock X470 Taichi",
+      "bios_version": "4.60",
+      "reason": "Donor z kompatybilną rodziną i wsparciem Raven Ridge"
+    },
+    "secondary_reference": {
+      "board": "Gigabyte X570 AORUS F10",
+      "reason": "Dodatkowe porównania dla implementacji X570 / DXE / platform-specific fixes"
+    }
+  },
+  "cpu": {
+    "name": "Athlon 3000G",
+    "architecture": "Raven Ridge",
+    "family": "17h",
+    "model": "11h",
+    "goal": "Uruchomić procesor na X570 Taichi poprzez transplantację / adaptację brakujących elementów wsparcia Raven Ridge"
+  },
+  "objective": {
+    "summary": "Doprowadzić do poprawnej inicjalizacji CPU na X570 Taichi z BIOS 2.70 poprzez mapowanie brakującego wsparcia Raven Ridge.",
+    "focus_areas": [
+      "SataController",
+      "AHCI DXE dispatch",
+      "AHCI Start()",
+      "helper 0x2078",
+      "helper 0x65FC",
+      "EFI_DEVICE_ERROR propagation"
+    ]
+  },
+  "baseline": {
+    "branch": "V86 / V87",
+    "notes": [
+      "V86 potwierdził obecność EFI_PCI_IO_PROTOCOL.",
+      "V87 ma poprawny układ Apriori.",
+      "NvramDxe pozostaje na pozycji 5 i nie jest rozbierany bez potrzeby.",
+      "Dalsze eksperymenty prowadzone są bez niszczenia tego układu."
+    ]
+  },
+  "known_good_state": {
+    "description": "Board działa poprawnie na stock BIOS z obsługiwanym procesorem Ryzen 5000/innym CPU z support list.",
+    "status": "względnie znane i używane jako punkt odniesienia"
+  },
+  "current_state": {
+    "post_codes": [
+      "98 - wczesne etapy",
+      "D4 / D5 / D3 / D6 - głęboka ścieżka AHCI",
+      "E1 - AHCI dispatch włączony",
+      "E7 - LocateHandleBuffer(ByProtocol, AHCI_BUS_INIT_PROTOCOL)",
+      "07 - obecny realny błąd post-init"
+    ],
+    "current_symptom": "AHCI Start() wykonuje się, helper 0x2078 wykonuje się, helper 0x65FC zwraca EFI_DEVICE_ERROR, co kończy się POST 07.",
+    "current_blocker": "Blokada znajduje się wewnątrz helpera 0x65FC po przejściu pierwszego warunku z wartości z +0x108/+0x10C.",
+    "current_path": "DXE Dispatcher -> SataController -> AHCI Start() -> helper 0x2078 -> helper 0x65FC -> EFI_DEVICE_ERROR -> POST 07"
+  },
+  "validated_progress": [
+    {
+      "version": "v138",
+      "result": "SataController Start() kończy się poprawnie",
+      "meaning": "SataController przestał być głównym blockerem."
+    },
+    {
+      "version": "v140",
+      "result": "E1, AHCI zaczyna być wykonywany",
+      "meaning": "Wymuszony DXE Apriori i dispatch AHCI są poprawnie aktywne."
+    },
+    {
+      "version": "v145",
+      "result": "E7, LocateHandleBuffer(ByProtocol, AHCI_BUS_INIT_PROTOCOL)",
+      "meaning": "Problem nie jest tylko w dispatchu; potrzebne jest wejście w AHCI Start()."
+    },
+    {
+      "version": "v150",
+      "result": "POST 07",
+      "meaning": "Występuje już realny błąd, nie tylko marker diagnostyczny."
+    },
+    {
+      "version": "v155",
+      "result": "0x65FC -> EFI_DEVICE_ERROR",
+      "meaning": "Helper 0x65FC jest bezpośrednim źródłem błędu."
+    },
+    {
+      "version": "v156",
+      "result": "RBX != 0, wartość z +0x108/+0x10C != 0",
+      "meaning": "Pierwszy lokalny warunek RBX == 0 nie jest przyczyną. Problem jest głębiej w 0x65FC."
+    }
+  ],
+  "disqualified_hypotheses": [
+    "Brak uruchomienia SataController",
+    "Sam DXE Apriori",
+    "Pozycja NvramDxe",
+    "Brak EFI_PCI_IO_PROTOCOL",
+    "OpenProtocol() jako pierwotne źródło obecnego 07",
+    "Sam problem z niedispatchowaniem AHCI",
+    "Maskowanie poprawnego statusu przez helper 0x2078",
+    "Pierwszy check w 0x65FC: RBX == 0 dla wartości z +0x108/+0x10C"
+  ],
+  "working_hypothesis": {
+    "summary": "Po potwierdzeniu, że złożona wartość z +0x108/+0x10C jest niezerowa, wewnętrzny kolejny warunek / call w helperze 0x65FC generuje EFI_DEVICE_ERROR i powoduje POST 07.",
+    "likely_location": "Wewnątrz 0x65FC, po sprawdzeniu wartości z +0x108/+0x10C",
+    "suspected_code_patterns": [
+      "call ...",
+      "test rax, rax",
+      "js error",
+      "cmp ...",
+      "je / jne device_error",
+      "jawnie ustawiające EFI_DEVICE_ERROR = 0x8000000000000007"
+    ],
+    "reasoning": [
+      "SataController i AHCI dispatch zostały już przejściowo potwierdzone jako działające.",
+      "Realny błąd pojawia się dopiero w 0x65FC.",
+      "Wartość z portów +0x108/+0x10C nie jest zerowa, więc pierwsza lokalna hipoteza nie wyjaśnia problemu.",
+      "Następny blocker musi być w dalszej części helpera."
+    ]
+  },
+  "assumptions": [
+    "Target CPU jest teoretycznie wspierany przez AGESA / platform, ale blokowany jest przez board-specific gate lub specyficzny branch dla Raven Ridge.",
+    "Problem jest w implementacji AHCI / controller init dla Raven Ridge, a nie w ogólnym układzie platformy.",
+    "Nie chodzi już o prosty DEPEX ani kolejność dispatchu, tylko o konkretny warunek w helperze 0x65FC.",
+    "Najbardziej prawdopodobnym kierunkiem jest dalszy binary-search / instrumentacja wewnątrz 0x65FC."
+  ],
+  "next_actions": [
+    "Dodać kolejny marker diagnostyczny poza pierwszym checkiem w 0x65FC.",
+    "Rozbić cały CFG 0x65FC na kolejne basic blocks.",
+    "Zidentyfikować pierwszy warunek po checku +0x108/+0x10C, który prowadzi do EFI_DEVICE_ERROR.",
+    "Instrumentować status zaraz po każdym następnym callu, a nie wyłącznie po return.",
+    "Rozróżniać: lokalny return EFI_DEVICE_ERROR vs propagację EFI_ERROR(Status) z niższego helpera.",
+    "Unikać powrotu do SataController / Apriori / DEPEX, dopóki nie znajdzie się konkretny warunek wewnątrz 0x65FC."
+  ],
+  "candidate_build": {
+    "next_version_hint": "V157",
+    "expected_behavior": "Dodatkowy marker na kolejnym bloku wewnątrz 0x65FC; nie ma sensu wracać do wcześniejszych warstw dopóki nie wyjdzie dokładny source of error."
+  },
+  "project_files": {
+    "state_log": "c:\\temp\\3000g\\Athlon 3000G na ASRock X570 Taichi — stan projektu 2026-08-24.md",
+    "config_file": "c:\\temp\\3000g\\bios_config.json"
+  },
+  "automation_notes": {
+    "workflow": "Dossier + prompt generation + reviewer loop + decision log",
+    "recommended_roles": {
+      "orchestrator": "Copilot",
+      "implementation_driver": "ChatGPT",
+      "reviewer": "Claude"
+    }
+  }
+}

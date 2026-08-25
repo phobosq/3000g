@@ -1,0 +1,42 @@
+## Recenzja niezależnego reviewera BIOS — Cycle 235 (F3/F4-F5/F6 discriminator)
+
+### 1. Major concerns
+
+- **Plan wciąż nie opiera się na dekompilacji.** To trzecia z rzędu propozycja budująca coraz bardziej rozbudowaną instrumentację (3 markery, warunkowe gałęzie, `test rax,rax`/`js`) na bazie tego samego niepotwierdzonego założenia o kształcie kodu. Zamiast redukować niepewność, projekt zwiększa złożoność patcha przy tej samej ilości realnej wiedzy o CFG. To odwrotna kolejność względem tego, co rekomendowałem poprzednio.
+- **Trzy markery w jednym buildzie to trzy niezależne miejsca ingerencji w nieznany kod maszynowy** — F3 (prosta instrumentacja, niskie ryzyko), ale F4/F5 wymaga wstrzyknięcia `test+js+POST` bezpośrednio po `call`, a F6 wymaga zidentyfikowania i oznaczenia "taken edge" nieznanego `cmp/test+jcc`. To trzy oddzielne miejsca, gdzie zły odczyt instrukcji (długość instrukcji, obecność prefiksów REX, względne adresy skoków) może przesunąć patch o bajt i uszkodzić cały moduł — nie tylko nie dać wyniku, ale zawiesić/zresetować platformę przed dotarciem do POST 07 w ogóle.
+- **Nie zaadresowano mojego wcześniejszego zastrzeżenia o zachowaniu RFLAGS/rejestrów scratch.** Dokument mówi "probe nie może nadpisywać RAX ani flag potrzebnych później bez ich odtworzenia" — ale to deklaracja intencji, nie konkretny mechanizm (`pushfq`/`popfq`, zapisanie do nieużywanego stack slotu, itd.). Bez konkretnego kodu patcha nie można ocenić, czy rzeczywiście jest bezpieczny.
+- **F6 zakłada, że "pierwszy lokalny warunek prowadzący do EFI_DEVICE_ERROR" jest jednoznacznie identyfikowalny i ma dokładnie jedną taken-edge do error.** Jeśli funkcja ma wspólny epilog/error block, do którego skacze więcej niż jeden warunek (bardzo typowe w kodzie kompilowanym przez MSVC dla AMI/EDK2), oznaczenie "tego jednego" compare jako F6 nie wyklucza, że błąd faktycznie pochodzi z innego, wcześniej niesprawdzonego warunku skaczącego do tego samego bloku docelowego.
+
+### 2. Missing evidence
+
+- Wciąż brak jakiejkolwiek dekompilacji lub choćby ręcznego zrzutu bajtów instrukcji od miejsca `RBX != 0` do punktu `ret EFI_DEVICE_ERROR`. Bez tego nie da się bezpiecznie zaprojektować F4/F5/F6 — to nie jest kwestia dodatkowej ostrożności, to warunek wykonalności patcha.
+- Brak potwierdzenia liczby bajtów dostępnych do wstrzyknięcia instrumentacji w tym miejscu (padding/NOP sled, czy trzeba relokować kod) — przy trzech punktach patchowania w jednym cyklu ryzyko przekroczenia dostępnej przestrzeni FFS/sekcji rośnie.
+- Brak informacji o tym, czy `0x65FC` ma jeden, czy więcej epilogów zwracających `EFI_DEVICE_ERROR` — to pytanie zadałem w poprzedniej rundzie i nadal nie zostało zaadresowane w evidence.
+- Brak alternatywnego, tańszego zestawu danych (np. stan rejestrów HBA/BAR) który mógłby rozstrzygnąć hipotezę bez wchodzenia głębiej w nieznany kod maszynowy.
+
+### 3. Alternative hypotheses
+
+- Możliwe, że nie ma tam pojedynczego "pierwszego calla" — może być krótka sekwencja kilku niezależnych lokalnych sprawdzeń (np. port implemented mask, CAP register bits, alignment) *przed* jakimkolwiek callem, co czyni podział na F4/F5 (call-centric) błędnym już na starcie.
+- Błąd może być wynikiem nieprawidłowej wartości w +0x108/+0x10C, która jest niezerowa, ale semantycznie nieprawidłowa (np. adres MMIO nie odpowiadający realnemu BAR AHCI z powodu problemów PciRootBridge/PciBus na gałęzi F10) — czyli "call fails" nie dlatego, że callee ma błąd logiczny, ale dlatego że dostaje śmieciowy parametr. To przesuwałoby prawdziwy root cause znów wcześniej w łańcuchu, a nie głębiej w 0x65FC.
+- Nadal aktualna hipoteza z poprzednich rund: problem z Timer/Stall Arch Protocol powodujący fałszywy timeout, jeśli którykolwiek z helperów w tej ścieżce czeka na zdarzenie.
+
+### 4. Safer alternative edits or instrumentation
+
+- **Zredukować Cycle 235 do jednego markera (F3 only) w tym cyklu.** Potwierdzić samo dotarcie do bloku po `RBX != 0`, bez żadnej ingerencji w call/compare, których kształtu nie znamy. To eliminuje ryzyko zepsucia instrukcji przy F4/F5/F6 w tej samej iteracji.
+- Jeśli F3 się potwierdzi, **dopiero wtedy** — na bazie zaktualizowanej wiedzy (i najlepiej krótkiego zrzutu bajtów wokół F3 pozyskanego z tego samego buildu, jeśli narzędzia na to pozwalają) — projektować F4/F5 jako osobny, następny cykl.
+- F6 (oznaczanie taken-edge nieznanego warunku) odłożyć do trzeciego, jeszcze późniejszego cyklu — nie łączyć trzech nowych, niezweryfikowanych punktów instrumentacji w jednym flashu.
+- Dla F4/F5, gdy przyjdzie ich kolej: jawnie zapisać pełny kontekst (`pushfq`, zapis RAX na stosie) przed jakimkolwiek `test`/`POST out`, i odtworzyć go tuż przed przekazaniem sterowania z powrotem do oryginalnego kodu — z podaniem konkretnych instrukcji, nie tylko deklaracji "nie nadpiszę".
+- Równolegle prowadzić niezależną, nie-inwazyjną ścieżkę weryfikacji: potwierdzenie mapowania BAR/MMIO AHCI przez PciIo przed Start(), jako tańszy test alternatywnej hipotezy.
+
+### 5. Minimal validation plan
+
+1. **Cycle 235 = tylko F3.** Jeden marker, zero warunkowej logiki, zero ingerencji w call/compare.
+2. Flash, potwierdź `F3 → 07` (lub brak F3, co obaliłoby obecny model CFG).
+3. Jeśli F3 potwierdzony: spróbować pozyskać zrzut bajtów instrukcji bezpośrednio po punkcie F3 (nawet z tego samego obrazu, offline, przed kolejnym flashem) zamiast zgadywać kształt `call`/`cmp`.
+4. Dopiero na tej podstawie zaprojektować Cycle 236 z F4/F5 jako pojedynczy, izolowany krok.
+5. F6 zaplanować jako Cycle 237, wyłącznie jeśli F4/F5 potwierdzą "SUCCESS" i zawężą lokalizację do konkretnego compare.
+6. Równolegle (nie w tym samym buildzie, ale jako osobna ścieżka analizy) zebrać dane o stanie BAR/MMIO AHCI, żeby mieć niezależny check przeciw hipotezie "błąd jest głęboko w 0x65FC".
+
+### 6. Final verdict
+
+**Need more evidence / reject w obecnym zakresie.** Odrzucam łączenie F3+F4/F5+F6 w jednym cyklu 235 — to trzy niezweryfikowane punkty ingerencji w nieznany kod maszynowy naraz, co jest dokładnie tym "risk of overbroad patch", przed którym miałem ostrzegać. Akceptowalny jest wyłącznie zredukowany zakres: sam marker F3 w tym cyklu, z resztą odłożoną do kolejnych, mniejszych iteracji po zebraniu realnych danych o kształcie kodu.

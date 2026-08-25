@@ -1,0 +1,193 @@
+1. **Hypothesis**
+
+Pierwszy rzeczywisty error w `0x65FC` leży **po potwierdzonym `RBX != 0`** i należy do jednej z dwóch klas:
+
+* niższy helper zwraca `EFI_ERROR(Status)`, a `0x65FC` mapuje/propaguje go jako `EFI_DEVICE_ERROR`,
+* helper wraca sukcesem, ale następny lokalny `test/cmp + jcc` kieruje wykonanie do bloku ustawiającego `EFI_DEVICE_ERROR`.
+
+2. **Most likely BIOS area / function**
+
+Wyłącznie:
+
+```text
+AHCI helper 0x65FC
+    ↓
+confirmed: composed +0x108/+0x10C != 0
+    ↓
+first CALL / first conditional block after RBX check
+    ↓
+EFI_DEVICE_ERROR exit
+```
+
+Nie ruszać `0x2078`, DEPEX ani Apriori.
+
+3. **Exact change or instrumentation**
+
+Zrobić jeden discriminator build z **3 markerami**.
+
+**Probe A — entry do następnego basic blocku**
+
+Wstawić bezpośrednio za gałęzią potwierdzającą `RBX != 0`, ale przed pierwszym istotnym `call/test/cmp`:
+
+```text
+A = osiągnięto ścieżkę po RBX != 0
+```
+
+Np. marker `F3`.
+
+**Probe B — wynik pierwszego status-returning CALL**
+
+Jeżeli następna istotna instrukcja to:
+
+```asm
+call sub_xxxx
+```
+
+zachować `RAX` i rozdzielić wynik:
+
+```asm
+call    sub_xxxx
+
+test    rax, rax
+js      MARK_ERROR
+
+; MARK_SUCCESS
+```
+
+Markery:
+
+```text
+B0 = CALL returned EFI_SUCCESS
+B1 = CALL returned EFI_ERROR
+```
+
+Np.:
+
+```text
+F4 = success
+F5 = EFI_ERROR
+```
+
+Kluczowe: probe nie może nadpisywać `RAX` ani flag potrzebnych później bez ich odtworzenia.
+
+**Probe C — lokalna gałąź error**
+
+Jeżeli `CALL` przejdzie, umieścić trzeci marker **na taken edge pierwszego kolejnego `cmp/test + jcc`, którego jedna gałąź dociera do `EFI_DEVICE_ERROR`**:
+
+```text
+F6 = local condition selected error path
+```
+
+Schemat:
+
+```text
+RBX != 0
+  |
+ [F3]
+  |
+ CALL X
+  |
+  +-- EFI_ERROR --> [F5] --> original error path
+  |
+  +-- SUCCESS ----> [F4]
+                      |
+                    cmp/test
+                      |
+                      +-- error edge --> [F6]
+```
+
+Nie bypassować żadnej gałęzi w tym buildzie.
+
+4. **Why this is plausible**
+
+Mamy już dwa twarde wyniki:
+
+```text
+0x65FC returns EFI_DEVICE_ERROR
+RBX/value(+108/+10C) != 0
+```
+
+Zatem najwcześniejszy znany lokalny `RBX == 0` error path nie jest wykonywany.
+
+Logicznie następny kandydat jest dominowany przez:
+
+```text
+RBX != 0
+```
+
+i musi być albo:
+
+```text
+CALL → bad Status
+```
+
+albo:
+
+```text
+CALL/some setup succeeds
+→ local validation fails
+```
+
+To jest znacznie bardziej precyzyjne niż dalsze instrumentowanie callerów, ponieważ zarówno `0x2078`, jak i wejście do `0x65FC` są już potwierdzone.
+
+5. **Expected POST result**
+
+Interpretacja jednego bootu:
+
+```text
+F3 → F5 → 07
+```
+
+oznacza:
+
+> pierwszy niższy helper jest źródłem failure. Następny cykl schodzi do tego callee.
+
+```text
+F3 → F4 → F6 → 07
+```
+
+oznacza:
+
+> helper wrócił sukcesem; pierwszy prawdziwy error jest lokalnym compare/test w `0x65FC`.
+
+```text
+F3 → F4 → 07
+```
+
+bez `F6` oznacza:
+
+> badany compare nie jest źródłem; error leży dalej.
+
+Brak `F3` oznacza, że obecny CFG jest niepełny i istnieje wcześniejsza ścieżka po checku wartości.
+
+6. **What would falsify this**
+
+Teorię falsyfikuje sytuacja, w której:
+
+```text
+F3
+F4
+```
+
+są osiągane, error-edge oznaczony `F6` nie jest brany, a `0x65FC` nadal zwraca `EFI_DEVICE_ERROR`.
+
+Wtedy pierwszy error leży **jeszcze później**, a nie w pierwszym callu ani następującym po nim lokalnym warunku.
+
+Tak samo `F5` nie powinien być interpretowany jako dowód, jeśli badany `call` nie zwraca `EFI_STATUS`; najpierw trzeba potwierdzić semantykę jego `RAX`.
+
+7. **Minimal validation plan**
+
+8. Zidentyfikować pierwszy basic block po potwierdzonym `RBX != 0`.
+
+9. Oznaczyć wejście jako `F3`.
+
+10. Jeśli występuje status-returning `call`, rozdzielić:
+
+    * `F4 = success`,
+    * `F5 = EFI_ERROR`.
+
+11. Oznaczyć taken edge pierwszego lokalnego warunku prowadzącego do `EFI_DEVICE_ERROR` jako `F6`.
+
+12. Wykonać **jeden boot bez żadnego bypassu**.
+
+Najbardziej wartościowy wynik to `F3 → F5 → 07`, bo natychmiast wskazuje konkretny następny helper do rozebrania. Jeśli będzie `F3 → F4 → F6 → 07`, następny patch powinien instrumentować **operandy dokładnie tego compare**, a nie poszerzać zakres analizy.

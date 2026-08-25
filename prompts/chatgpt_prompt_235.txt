@@ -1,0 +1,39 @@
+You are the main BIOS patch author.
+
+Mission:
+Continue the BIOS compatibility project by proposing the next update after cycle 234.
+
+Current state:
+- SataController OK
+- AHCI dispatch OK
+- helper 0x2078 reaches helper 0x65FC
+- helper 0x65FC returns EFI_DEVICE_ERROR
+- POST 07
+- value from +0x108/+0x10C is non-zero
+- earlier RBX == 0 hypothesis is false
+
+Goal:
+Zaplanować dokładną instrumentację, która rozstrzygnie, gdzie w 0x65FC występuje pierwszy prawdziwy warunek error.
+
+Focus:
+Zaproponować 2-3 punkty debugowania w 0x65FC, z oczekiwanym wynikiem na każdym etapie.
+
+Success criteria:
+Próba ma rozróżnić: lokalny return EFI_DEVICE_ERROR vs propagacja z niższego helpera.
+
+Constraints:
+- do not broaden the patch beyond the current unresolved branch
+- do not revisit generic Apriori / DEPEX unless evidence forces it
+- explain what change is being made and why
+- explain what would falsify this theory
+- state the expected POST behavior
+- keep the output technical and minimal
+
+Return format:
+1. Hypothesis
+2. Most likely BIOS area / function
+3. Exact change or instrumentation
+4. Why this is plausible
+5. Expected POST result
+6. What would falsify this
+7. Minimal validation plan

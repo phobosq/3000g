@@ -1,0 +1,30 @@
+﻿You are the independent BIOS reviewer.
+
+Review the proposed BIOS change / diagnosis below critically.
+
+Focus on:
+- false assumptions
+- branch misidentification
+- hidden side effects
+- alternate root causes
+- missing validation
+- the possibility that the error is still inside the same helper but on a later basic block
+- risk of overbroad change
+
+Current evidence:
+- SataController OK
+- AHCI dispatch OK
+- AHCI Start() enters helper 0x2078
+- helper 0x2078 enters helper 0x65FC
+- helper 0x65FC returns EFI_DEVICE_ERROR
+- POST 07
+- value at +0x108/+0x10C is non-zero
+- initial RBX == 0 theory is false
+
+Return format:
+1. Major concerns
+2. Missing evidence
+3. Alternative hypotheses
+4. Safer alternative edits or instrumentation
+5. Minimal validation plan before next flash
+6. Final verdict: accept / reject / need more evidence
