@@ -39,6 +39,7 @@ class SymbolKind(str, Enum):
     ZERO = "ZERO"
     FROM_CALL = "FROM_CALL"
     CONSTANT = "CONSTANT"
+    EXPRESSION = "EXPRESSION"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,47 @@ EFI_DEVICE_ERROR_VALUE = SymbolicValue(
 ZERO_VALUE = SymbolicValue(
     SymbolKind.ZERO
 )
+
+
+def symbolic_expression(
+    value: SymbolicValue,
+) -> str:
+
+    if (
+        value.kind
+        == SymbolKind.EXPRESSION
+        and value.detail is not None
+    ):
+        return value.detail
+
+    if (
+        value.kind
+        == SymbolKind.FROM_CALL
+        and value.detail is not None
+    ):
+        return (
+            f"CALL({value.detail})"
+        )
+
+    if (
+        value.kind
+        == SymbolKind.CONSTANT
+        and value.detail is not None
+    ):
+        return value.detail
+
+    if value.kind == SymbolKind.ZERO:
+        return "0"
+
+    if (
+        value.kind
+        == SymbolKind.EFI_DEVICE_ERROR
+    ):
+        return (
+            "0x8000000000000007"
+        )
+
+    return "UNKNOWN"
 
 
 @dataclass
@@ -180,6 +222,9 @@ class FlagSource:
     address: int
     mnemonic: str
     operands: str
+
+    value: SymbolicValue | None = None
+    value_register: str | None = None
 
     def __str__(self):
         return (
@@ -585,6 +630,188 @@ def apply_xor(
         )
 
 
+def apply_and(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if len(operands) != 2:
+        return
+
+    dst, src = operands
+
+    if not is_register_operand(dst):
+        return
+
+    immediate = parse_immediate(
+        src
+    )
+
+    if immediate is None:
+
+        state.set_reg(
+            dst,
+            UNKNOWN,
+        )
+
+        return
+
+    old_value = state.get_reg(
+        dst
+    )
+
+    # Constant folding where trivial.
+    if old_value.kind == SymbolKind.ZERO:
+
+        state.set_reg(
+            dst,
+            ZERO_VALUE,
+        )
+
+        return
+
+    if (
+        old_value.kind
+        == SymbolKind.CONSTANT
+        and old_value.detail is not None
+    ):
+
+        try:
+            old_constant = int(
+                old_value.detail,
+                0,
+            )
+
+        except ValueError:
+            old_constant = None
+
+        if old_constant is not None:
+
+            result = (
+                old_constant
+                & immediate
+            )
+
+            if result == 0:
+                value = ZERO_VALUE
+
+            else:
+                value = SymbolicValue(
+                    SymbolKind.CONSTANT,
+                    f"0x{result:X}",
+                    origin=old_value.origin,
+                )
+
+            state.set_reg(
+                dst,
+                value,
+            )
+
+            return
+
+    expression = (
+        f"({symbolic_expression(old_value)} "
+        f"& 0x{immediate:X})"
+    )
+
+    state.set_reg(
+        dst,
+        SymbolicValue(
+            SymbolKind.EXPRESSION,
+            expression,
+            origin=old_value.origin,
+        ),
+    )
+
+    state.notes.append(
+        f"0x{insn.address:X}: "
+        f"{canonical_register(dst)} "
+        f"<- {expression}"
+    )
+
+
+def apply_dec(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if len(operands) != 1:
+        return
+
+    dst = operands[0]
+
+    if not is_register_operand(dst):
+        return
+
+    old_value = state.get_reg(
+        dst
+    )
+
+    if (
+        old_value.kind
+        == SymbolKind.CONSTANT
+        and old_value.detail is not None
+    ):
+
+        try:
+            old_constant = int(
+                old_value.detail,
+                0,
+            )
+
+        except ValueError:
+            old_constant = None
+
+        if old_constant is not None:
+
+            result = (
+                old_constant - 1
+            ) & 0xFFFFFFFFFFFFFFFF
+
+            if result == 0:
+                value = ZERO_VALUE
+            else:
+                value = SymbolicValue(
+                    SymbolKind.CONSTANT,
+                    f"0x{result:X}",
+                    origin=old_value.origin,
+                )
+
+            state.set_reg(
+                dst,
+                value,
+            )
+
+            return
+
+    expression = (
+        f"({symbolic_expression(old_value)} - 1)"
+    )
+
+    state.set_reg(
+        dst,
+        SymbolicValue(
+            SymbolKind.EXPRESSION,
+            expression,
+            origin=old_value.origin,
+        ),
+    )
+
+    state.notes.append(
+        f"0x{insn.address:X}: "
+        f"{canonical_register(dst)} "
+        f"<- {expression}"
+    )
+
+
 def apply_lea(
     state: SymbolicState,
     insn: InstructionInfo,
@@ -669,10 +896,36 @@ def apply_flag_instruction(
     insn: InstructionInfo,
 ):
 
+    operands = split_operands(
+        insn.op_str
+    )
+
+    value = None
+    value_register = None
+
+    if (
+        operands
+        and is_register_operand(
+            operands[0]
+        )
+    ):
+
+        value_register = (
+            canonical_register(
+                operands[0]
+            )
+        )
+
+        value = state.get_reg(
+            operands[0]
+        )
+
     state.flags_source = FlagSource(
         address=insn.address,
         mnemonic=insn.mnemonic.lower(),
         operands=insn.op_str.lower(),
+        value=value,
+        value_register=value_register,
     )
 
 
@@ -770,14 +1023,100 @@ def condition_from_flags(
             is_register_operand(reg)
             and imm is not None
         ):
-            reg = reg.upper()
+
+            # ---------------------------------------
+            # Constant folding
+            #
+            # If the tested register has a known
+            # symbolic value, resolve the branch
+            # immediately instead of creating
+            # impossible constraints such as:
+            #
+            #   (0 & 0x7C000000) != 0
+            # ---------------------------------------
+
+            known_value = None
+
+            if flags.value is not None:
+
+                if (
+                    flags.value.kind
+                    == SymbolKind.ZERO
+                ):
+                    known_value = 0
+
+                elif (
+                    flags.value.kind
+                    == SymbolKind.CONSTANT
+                    and flags.value.detail
+                    is not None
+                ):
+                    try:
+                        known_value = int(
+                            flags.value.detail,
+                            0,
+                        )
+
+                    except ValueError:
+                        known_value = None
+
+            if known_value is not None:
+
+                test_result = (
+                    known_value
+                    & imm
+                )
+
+                if condition in {
+                    "e",
+                    "z",
+                }:
+                    return (
+                        "TRUE"
+                        if test_result == 0
+                        else "FALSE"
+                    )
+
+                if condition in {
+                    "ne",
+                    "nz",
+                }:
+                    return (
+                        "TRUE"
+                        if test_result != 0
+                        else "FALSE"
+                    )
+
+            # ---------------------------------------
+            # Symbolic rendering
+            # ---------------------------------------
+
+            display_value = reg.upper()
+
+            if (
+                flags.value is not None
+                and flags.value.kind
+                in {
+                    SymbolKind.EXPRESSION,
+                    SymbolKind.FROM_CALL,
+                    SymbolKind.CONSTANT,
+                    SymbolKind.ZERO,
+                }
+            ):
+
+                rendered = symbolic_expression(
+                    flags.value
+                )
+
+                if rendered != "UNKNOWN":
+                    display_value = rendered
 
             if condition in {
                 "e",
                 "z",
             }:
                 return (
-                    f"({reg} & 0x{imm:X}) == 0"
+                    f"({display_value} & 0x{imm:X}) == 0"
                 )
 
             if condition in {
@@ -785,7 +1124,7 @@ def condition_from_flags(
                 "nz",
             }:
                 return (
-                    f"({reg} & 0x{imm:X}) != 0"
+                    f"({display_value} & 0x{imm:X}) != 0"
                 )
 
     # ---------------------------------------
@@ -882,6 +1221,7 @@ def condition_from_flags(
                 )
 
     return None
+
 
 def negate_condition(
     condition: str,
@@ -1012,6 +1352,98 @@ def apply_cmov(
     )
 
     # ---------------------------------------
+    # Constant condition resolution
+    # ---------------------------------------
+
+    # Taken path is impossible.
+    if taken_condition == "FALSE":
+
+        not_taken = state.clone()
+
+        not_taken.notes.append(
+            f"0x{insn.address:X}: "
+            f"{mnemonic} NOT taken; "
+            f"condition=TRUE "
+            f"(taken condition resolved FALSE); "
+            f"flags from "
+            f"{state.flags_source}"
+        )
+
+        return [
+            not_taken
+        ]
+
+    # Taken path is guaranteed.
+    if taken_condition == "TRUE":
+
+        taken = state.clone()
+
+        value = taken.get_reg(src)
+
+        taken.set_reg(
+            dst,
+            value,
+        )
+
+        taken.notes.append(
+            f"0x{insn.address:X}: "
+            f"{mnemonic} taken: "
+            f"{canonical_register(dst)} "
+            f"<- {value}; "
+            f"condition=TRUE; "
+            f"flags from "
+            f"{state.flags_source}"
+        )
+
+        return [
+            taken
+        ]
+
+    # Not-taken path is impossible.
+    if not_taken_condition == "FALSE":
+
+        taken = state.clone()
+
+        value = taken.get_reg(src)
+
+        taken.set_reg(
+            dst,
+            value,
+        )
+
+        taken.notes.append(
+            f"0x{insn.address:X}: "
+            f"{mnemonic} taken: "
+            f"{canonical_register(dst)} "
+            f"<- {value}; "
+            f"condition=TRUE "
+            f"(not-taken condition resolved FALSE); "
+            f"flags from "
+            f"{state.flags_source}"
+        )
+
+        return [
+            taken
+        ]
+
+    # Not-taken path is guaranteed.
+    if not_taken_condition == "TRUE":
+
+        not_taken = state.clone()
+
+        not_taken.notes.append(
+            f"0x{insn.address:X}: "
+            f"{mnemonic} NOT taken; "
+            f"condition=TRUE; "
+            f"flags from "
+            f"{state.flags_source}"
+        )
+
+        return [
+            not_taken
+        ]
+
+    # ---------------------------------------
     # Not taken
     # ---------------------------------------
 
@@ -1118,18 +1550,47 @@ def execute_symbolic_instruction(
         )
         return [state]
 
-    if mnemonic in {
-        "test",
-        "cmp",
-        "and",
-        "or",
-    }:
+    if mnemonic == "and":
+
+        apply_and(
+            state,
+            insn,
+        )
+
         apply_flag_instruction(
             state,
             insn,
         )
+
         return [state]
 
+    if mnemonic == "dec":
+
+        apply_dec(
+            state,
+            insn,
+        )
+
+        apply_flag_instruction(
+            state,
+            insn,
+        )
+
+        return [state]
+
+    if mnemonic in {
+        "test",
+        "cmp",
+        "or",
+    }:
+
+        apply_flag_instruction(
+            state,
+            insn,
+        )
+
+        return [state]
+    
     if mnemonic.startswith("cmov"):
         return apply_cmov(
             state,
@@ -2665,7 +3126,25 @@ def run_symbolic_cfg(
                         )
                     )
 
-                    if condition is not None:
+                    if condition == "FALSE":
+
+                        child.notes.append(
+                            f"CFG edge impossible: "
+                            f"condition {edge.condition_code} "
+                            f"resolved FALSE"
+                        )
+
+                        continue
+
+                    elif condition == "TRUE":
+
+                        child.notes.append(
+                            f"CFG edge condition "
+                            f"{edge.condition_code} "
+                            f"resolved TRUE"
+                        )
+
+                    elif condition is not None:
 
                         add_condition(
                             child,
@@ -2676,7 +3155,7 @@ def run_symbolic_cfg(
                                 else None
                             ),
                         )
-                        
+
                         child.conditions = list(
                             normalize_conditions(
                                 child.conditions
