@@ -690,30 +690,53 @@ def normalize_conditions(
 def add_condition(
     state: SymbolicState,
     condition: str | None,
+    source_address: int | None = None,
 ):
 
     if condition is None:
         return
 
-    # Live symbolic constraints.
+    # ---------------------------------------
+    # Live symbolic constraint
     #
-    # These may later be invalidated when the
-    # register they depend on receives a new value.
+    # Keep this address-free. It participates
+    # in contradiction pruning and may later
+    # be invalidated when the referenced
+    # register is overwritten.
+    # ---------------------------------------
+
     if condition not in state.conditions:
         state.conditions.append(
             condition
         )
 
-    # Historical path predicates.
+    # ---------------------------------------
+    # Historical path predicate
     #
-    # These describe WHY execution reached the
-    # current path. They are never invalidated by
-    # later register writes.
-    if condition not in state.path_conditions:
-        state.path_conditions.append(
-            condition
+    # Preserve provenance for diagnostics.
+    # This is never invalidated when the
+    # referenced register changes.
+    # ---------------------------------------
+
+    if source_address is not None:
+
+        path_condition = (
+            f"0x{source_address:X}: "
+            f"{condition}"
         )
-        
+
+    else:
+
+        path_condition = condition
+
+    if (
+        path_condition
+        not in state.path_conditions
+    ):
+        state.path_conditions.append(
+            path_condition
+        )
+
 
 def condition_from_flags(
     flags: FlagSource | None,
@@ -997,6 +1020,11 @@ def apply_cmov(
     add_condition(
         not_taken,
         not_taken_condition,
+        (
+            state.flags_source.address
+            if state.flags_source is not None
+            else None
+        ),
     )
 
     not_taken.notes.append(
@@ -1024,6 +1052,11 @@ def apply_cmov(
     add_condition(
         taken,
         taken_condition,
+        (
+            state.flags_source.address
+            if state.flags_source is not None
+            else None
+        ),
     )
 
     taken.notes.append(
@@ -2637,8 +2670,13 @@ def run_symbolic_cfg(
                         add_condition(
                             child,
                             condition,
+                            (
+                                child.flags_source.address
+                                if child.flags_source is not None
+                                else None
+                            ),
                         )
-
+                        
                         child.conditions = list(
                             normalize_conditions(
                                 child.conditions
