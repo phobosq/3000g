@@ -6,12 +6,18 @@ from pathlib import Path
 
 from tools.cfg import (
     build_cfg_internal,
+    classify_return_check,
     collect_calls,
     collect_status_check_candidates_v3,
     instruction_immediates,
     find_error_value_definitions,
+    summarize_call_derived_returns,
+    summarize_efi_error_returns,
     trace_register_uses,
+    build_call_graph,
     EFI_DEVICE_ERROR,
+    run_symbolic_cfg,
+    summarize_return_states,
 )
 
 
@@ -51,6 +57,24 @@ def main():
         args.file,
         start_rva,
         args.max_bytes,
+    )
+
+    symbolic_states = run_symbolic_cfg(
+        cfg,
+        max_states=500,
+    )
+
+    symbolic_returns = (
+        summarize_return_states(
+            symbolic_states
+        )
+    )
+
+    call_graph = build_call_graph(
+        args.file,
+        start_rva,
+        depth=2,
+        max_bytes_per_function=0x2000,
     )
 
     calls = collect_calls(cfg)
@@ -206,7 +230,7 @@ def main():
 
         "efi_error_dataflow": error_dataflow,
 
-        "status_check_candidates": [
+        "return_value_check_candidates": [
             {
                 "call_site":
                     f"0x{x['call'].address:X}",
@@ -236,10 +260,34 @@ def main():
                         f"{x['branch'].mnemonic} "
                         f"{x['branch'].op_str}"
                     ),
+                "classification": classify_return_check(
+                        x["check"],
+                        x["branch"],
+                    ),
             }
             for x
             in status_checks
         ],
+        "call_graph": call_graph,
+        "symbolic_return_analysis": {
+            "completed_states": (
+                len(symbolic_states)
+            ),
+            "unique_return_values": len(
+                symbolic_returns
+            ),
+            "returns": (
+                symbolic_returns
+            ),
+        },
+        "efi_device_error_return_paths":
+            summarize_efi_error_returns(
+                symbolic_states
+            ),
+        "call_derived_return_paths":
+            summarize_call_derived_returns(
+                symbolic_states
+            ),
     }
 
     text = json.dumps(

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
+from enum import Enum
+from copy import deepcopy
 
 import pefile
+import re
 
 from capstone import (
     Cs,
@@ -22,6 +25,39 @@ from agents import function_tool
 from .common import safe_path
 
 
+class SymbolKind(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    EFI_DEVICE_ERROR = "EFI_DEVICE_ERROR"
+    ZERO = "ZERO"
+    FROM_CALL = "FROM_CALL"
+    CONSTANT = "CONSTANT"
+
+
+@dataclass(frozen=True)
+class SymbolicValue:
+    kind: SymbolKind
+    detail: str | None = None
+    origin: int | None = None
+
+    def __str__(self):
+        if self.detail is None:
+            return self.kind.value
+
+        return f"{self.kind.value}({self.detail})"
+
+UNKNOWN = SymbolicValue(
+    SymbolKind.UNKNOWN
+)
+
+EFI_DEVICE_ERROR_VALUE = SymbolicValue(
+    SymbolKind.EFI_DEVICE_ERROR
+)
+
+ZERO_VALUE = SymbolicValue(
+    SymbolKind.ZERO
+)
+
+
 @dataclass
 class InstructionInfo:
     address: int
@@ -38,6 +74,506 @@ class BasicBlock:
     instructions: list[InstructionInfo] = field(default_factory=list)
     successors: list[int] = field(default_factory=list)
     terminal_reason: str = ""
+
+
+@dataclass
+class SymbolicState:
+    registers: dict[
+        str,
+        SymbolicValue
+    ] = field(default_factory=dict)
+
+    stack_slots: dict[
+        str,
+        SymbolicValue
+    ] = field(default_factory=dict)
+
+    flags_source: str | None = None
+
+    path: list[int] = field(
+        default_factory=list
+    )
+
+    notes: list[str] = field(
+        default_factory=list
+    )
+
+    block_visits: dict[
+        int,
+        int
+    ] = field(
+        default_factory=dict
+    )
+
+    def clone(self):
+        return deepcopy(self)
+
+    def get_reg(self, reg: str) -> SymbolicValue:
+        return self.registers.get(
+            canonical_register(reg),
+            UNKNOWN,
+        )
+
+    def set_reg(
+        self,
+        reg: str,
+        value: SymbolicValue,
+    ):
+        self.registers[
+            canonical_register(reg)
+        ] = value
+
+
+REGISTER_ALIASES = {
+    "rax": "rax",
+    "eax": "rax",
+    "ax": "rax",
+    "al": "rax",
+    "ah": "rax",
+
+    "rbx": "rbx",
+    "ebx": "rbx",
+    "bx": "rbx",
+    "bl": "rbx",
+    "bh": "rbx",
+
+    "rcx": "rcx",
+    "ecx": "rcx",
+    "cx": "rcx",
+    "cl": "rcx",
+    "ch": "rcx",
+
+    "rdx": "rdx",
+    "edx": "rdx",
+    "dx": "rdx",
+    "dl": "rdx",
+    "dh": "rdx",
+
+    "rsi": "rsi",
+    "esi": "rsi",
+    "si": "rsi",
+    "sil": "rsi",
+
+    "rdi": "rdi",
+    "edi": "rdi",
+    "di": "rdi",
+    "dil": "rdi",
+
+    "r12": "r12",
+    "r12d": "r12",
+    "r12w": "r12",
+    "r12b": "r12",
+
+    "r13": "r13",
+    "r13d": "r13",
+    "r13w": "r13",
+    "r13b": "r13",
+
+    "r14": "r14",
+    "r14d": "r14",
+    "r14w": "r14",
+    "r14b": "r14",
+
+    "r15": "r15",
+    "r15d": "r15",
+    "r15w": "r15",
+    "r15b": "r15",
+}
+
+
+def canonical_register(
+    register: str,
+) -> str:
+    return REGISTER_ALIASES.get(
+        register.lower(),
+        register.lower(),
+    )
+
+
+def split_operands(
+    op_str: str,
+) -> list[str]:
+    if not op_str:
+        return []
+
+    return [
+        x.strip().lower()
+        for x in op_str.split(",")
+    ]
+
+
+def is_register_operand(
+    operand: str,
+) -> bool:
+    return operand in REGISTER_ALIASES
+
+
+def parse_immediate(
+    operand: str,
+) -> int | None:
+
+    operand = operand.strip().lower()
+
+    try:
+        return int(
+            operand,
+            0,
+        )
+    except ValueError:
+        return None
+    
+
+def apply_mov(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if len(operands) != 2:
+        return
+
+    dst, src = operands
+
+    dst_stack = normalize_stack_slot(
+        dst
+    )
+
+    src_stack = normalize_stack_slot(
+        src
+    )
+
+    # stack <- register
+    if (
+        dst_stack is not None
+        and is_register_operand(src)
+    ):
+        value = state.get_reg(src)
+
+        state.stack_slots[
+            dst_stack
+        ] = value
+
+        state.notes.append(
+            f"0x{insn.address:X}: "
+            f"{dst_stack} <- {value}"
+        )
+
+        return
+
+    # register <- stack
+    if (
+        is_register_operand(dst)
+        and src_stack is not None
+    ):
+        value = state.stack_slots.get(
+            src_stack,
+            UNKNOWN,
+        )
+
+        state.set_reg(
+            dst,
+            value,
+        )
+
+        state.notes.append(
+            f"0x{insn.address:X}: "
+            f"{canonical_register(dst)} "
+            f"<- {value} "
+            f"from {src_stack}"
+        )
+
+        return
+
+    if not is_register_operand(dst):
+        return
+
+    # register <- register
+    if is_register_operand(src):
+
+        value = state.get_reg(src)
+
+        state.set_reg(
+            dst,
+            value,
+        )
+
+        if value.kind != SymbolKind.UNKNOWN:
+            state.notes.append(
+                f"0x{insn.address:X}: "
+                f"{canonical_register(dst)} "
+                f"<- {value} "
+                f"from {canonical_register(src)}"
+            )
+
+        return
+
+    # register <- immediate
+    immediate = parse_immediate(src)
+
+    if immediate is not None:
+
+        immediate &= (
+            0xFFFFFFFFFFFFFFFF
+        )
+
+        if immediate == 0:
+            value = ZERO_VALUE
+
+        elif immediate == EFI_DEVICE_ERROR:
+
+            value = SymbolicValue(
+                SymbolKind.EFI_DEVICE_ERROR,
+                origin=insn.address,
+            )
+
+        else:
+            value = SymbolicValue(
+                SymbolKind.CONSTANT,
+                f"0x{immediate:X}",
+            )
+
+        state.set_reg(
+            dst,
+            value,
+        )
+
+        return
+
+    # register <- memory / unknown expression
+    state.set_reg(
+        dst,
+        UNKNOWN,
+    )
+
+
+def apply_xor(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if len(operands) != 2:
+        return
+
+    dst, src = operands
+
+    if (
+        is_register_operand(dst)
+        and is_register_operand(src)
+        and canonical_register(dst)
+        == canonical_register(src)
+    ):
+        state.set_reg(
+            dst,
+            ZERO_VALUE,
+        )
+        return
+
+    if is_register_operand(dst):
+        state.set_reg(
+            dst,
+            UNKNOWN,
+        )
+
+
+def apply_lea(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if not operands:
+        return
+
+    dst = operands[0]
+
+    if is_register_operand(dst):
+        state.set_reg(
+            dst,
+            UNKNOWN,
+        )
+
+
+def apply_call(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    if insn.target is not None:
+
+        value = SymbolicValue(
+            SymbolKind.FROM_CALL,
+            f"0x{insn.target:X}",
+            origin=insn.address,
+        )
+
+    else:
+
+        value = SymbolicValue(
+            SymbolKind.FROM_CALL,
+            "indirect",
+            origin=insn.address,
+        )
+
+    state.set_reg(
+        "rax",
+        value,
+    )
+
+    state.notes.append(
+        f"0x{insn.address:X}: "
+        f"RAX <- {state.get_reg('rax')}"
+    )
+
+
+def apply_flag_instruction(
+    state: SymbolicState,
+    insn: InstructionInfo,
+):
+
+    state.flags_source = (
+        f"0x{insn.address:X}: "
+        f"{insn.mnemonic} "
+        f"{insn.op_str}"
+    )
+
+
+def apply_cmov(
+    state: SymbolicState,
+    insn: InstructionInfo,
+) -> list[SymbolicState]:
+
+    operands = split_operands(
+        insn.op_str
+    )
+
+    if len(operands) != 2:
+        return [state]
+
+    dst, src = operands
+
+    if not (
+        is_register_operand(dst)
+        and is_register_operand(src)
+    ):
+        return [state]
+
+    # Branch A: cmov not taken
+    not_taken = state.clone()
+
+    not_taken.notes.append(
+        f"0x{insn.address:X}: "
+        f"{insn.mnemonic} NOT taken; "
+        f"flags from {state.flags_source}"
+    )
+
+    # Branch B: cmov taken
+    taken = state.clone()
+
+    taken.set_reg(
+        dst,
+        taken.get_reg(src),
+    )
+
+    taken.notes.append(
+        f"0x{insn.address:X}: "
+        f"{insn.mnemonic} taken: "
+        f"{canonical_register(dst)} <- "
+        f"{taken.get_reg(src)}; "
+        f"flags from {state.flags_source}"
+    )
+
+    return [
+        not_taken,
+        taken,
+    ]
+
+
+def execute_symbolic_instruction(
+    state: SymbolicState,
+    insn: InstructionInfo,
+) -> list[SymbolicState]:
+
+    state.path.append(
+        insn.address
+    )
+
+    mnemonic = insn.mnemonic.lower()
+
+    if mnemonic in {
+        "mov",
+        "movabs",
+    }:
+        apply_mov(
+            state,
+            insn,
+        )
+        return [state]
+
+    if mnemonic == "xor":
+        apply_xor(
+            state,
+            insn,
+        )
+        return [state]
+
+    if mnemonic == "lea":
+        apply_lea(
+            state,
+            insn,
+        )
+        return [state]
+
+    if mnemonic == "call":
+        apply_call(
+            state,
+            insn,
+        )
+        return [state]
+
+    if mnemonic in {
+        "test",
+        "cmp",
+        "and",
+        "or",
+    }:
+        apply_flag_instruction(
+            state,
+            insn,
+        )
+        return [state]
+
+    if mnemonic.startswith("cmov"):
+        return apply_cmov(
+            state,
+            insn,
+        )
+
+    return [state]
+
+
+def find_block_for_address(
+    cfg: dict,
+    address: int,
+) -> BasicBlock | None:
+
+    for block in cfg["blocks"].values():
+
+        for insn in block.instructions:
+
+            if insn.address == address:
+                return block
+
+    return None
 
 
 def _open_pe(relative_path: str):
@@ -1068,15 +1604,33 @@ def trace_register_uses(
     max_forward_bytes: int = 512,
 ) -> list[dict]:
 
-    instruction_map = (
-        reachable_instruction_map(cfg)
-    )
+    instruction_map = reachable_instruction_map(cfg)
 
     addresses = sorted(
         instruction_map.keys()
     )
 
     results = []
+
+    source_register = source_register.lower()
+
+    aliases = {
+        "rax": {"rax", "eax", "ax", "al", "ah"},
+        "rbx": {"rbx", "ebx", "bx", "bl", "bh"},
+        "rcx": {"rcx", "ecx", "cx", "cl", "ch"},
+        "rdx": {"rdx", "edx", "dx", "dl", "dh"},
+        "rsi": {"rsi", "esi", "si", "sil"},
+        "rdi": {"rdi", "edi", "di", "dil"},
+        "r12": {"r12", "r12d", "r12w", "r12b"},
+        "r13": {"r13", "r13d", "r13w", "r13b"},
+        "r14": {"r14", "r14d", "r14w", "r14b"},
+        "r15": {"r15", "r15d", "r15w", "r15b"},
+    }
+
+    register_set = aliases.get(
+        source_register,
+        {source_register},
+    )
 
     for address in addresses:
 
@@ -1091,19 +1645,58 @@ def trace_register_uses(
 
         insn = instruction_map[address]
 
-        text = insn.op_str.lower()
+        operand_text = insn.op_str.lower()
 
-        if source_register not in text:
+        operands = [
+            x.strip()
+            for x in operand_text.split(",")
+        ]
+
+        if not operands:
             continue
 
+        destination = operands[0]
+
+        uses_source = any(
+            reg in operand_text
+            for reg in register_set
+        )
+
+        if not uses_source:
+            continue
+
+        # Record the instruction first.
         results.append({
             "address": insn.address,
             "mnemonic": insn.mnemonic,
             "operand": insn.op_str,
         })
 
-    return results
+        # If this instruction writes a NEW value into the tracked
+        # register, the original definition is killed here.
+        destination_is_source = (
+            destination in register_set
+        )
 
+        if destination_is_source:
+
+            # Instructions such as:
+            #   mov rsi,...
+            #   lea rsi,...
+            #   pop rsi
+            #   xor rsi,rsi
+            #
+            # replace the old value.
+            if insn.mnemonic in {
+                "mov",
+                "movabs",
+                "lea",
+                "pop",
+                "xor",
+            }:
+                break
+
+    return results
 
 def build_call_graph(
     relative_path: str,
@@ -1119,7 +1712,7 @@ def build_call_graph(
         if function_rva in visited:
             return {
                 "function": f"0x{function_rva:X}",
-                "recursive": True,
+                "already_visited": True,
             }
 
         visited.add(function_rva)
@@ -1166,3 +1759,451 @@ def build_call_graph(
         start_rva,
         0,
     )
+
+
+def classify_return_check(
+    check: InstructionInfo,
+    branch: InstructionInfo,
+) -> str:
+
+    check_mnemonic = check.mnemonic.lower()
+    check_operands = check.op_str.lower()
+
+    branch_mnemonic = branch.mnemonic.lower()
+
+    # Classic x64 EFI_ERROR(Status) pattern:
+    #
+    # test rax,rax
+    # js error
+    #
+    if (
+        check_mnemonic == "test"
+        and check_operands in {
+            "rax, rax",
+            "eax, eax",
+        }
+        and branch_mnemonic in {
+            "js",
+            "jns",
+        }
+    ):
+        return "probable_efi_status"
+
+    # Comparing/testing specific bit masks generally indicates
+    # a returned data/state value rather than EFI_STATUS.
+    if check_mnemonic in {
+        "test",
+        "and",
+    }:
+        if (
+            "0x" in check_operands
+            and check_operands not in {
+                "rax, rax",
+                "eax, eax",
+            }
+        ):
+            return "probable_data_or_state"
+
+    return "unknown"
+
+
+def symbolic_state_key(
+    block_start: int,
+    state: SymbolicState,
+) -> tuple:
+
+    registers = tuple(
+        sorted(
+            (
+                reg,
+                str(value),
+            )
+            for reg, value
+            in state.registers.items()
+        )
+    )
+
+    stack_slots = tuple(
+        sorted(
+            (
+                slot,
+                str(value),
+            )
+            for slot, value
+            in state.stack_slots.items()
+        )
+    )
+
+    return (
+        block_start,
+        registers,
+        stack_slots,
+        state.flags_source,
+    )
+
+
+def run_symbolic_cfg(
+    cfg: dict,
+    max_states: int = 1000,
+    max_steps_per_state: int = 1000,
+) -> list[SymbolicState]:
+
+    blocks = cfg["blocks"]
+
+    start = cfg["start_rva"]
+
+    initial = SymbolicState()
+
+    pending = [
+        (
+            start,
+            initial,
+        )
+    ]
+
+    completed = []
+    processed_states = 0
+    seen_states = set()
+
+    while pending:
+
+        block_start, state = (
+            pending.pop()
+        )
+
+        state_key = symbolic_state_key(
+            block_start,
+            state,
+        )
+
+        if state_key in seen_states:
+            continue
+
+        seen_states.add(
+            state_key
+        )
+
+        state.block_visits[
+            block_start
+        ] = (
+            state.block_visits.get(
+                block_start,
+                0,
+            )
+            + 1
+        )
+
+        if state.block_visits[block_start] > 12:
+            state.notes.append(
+                f"Loop visit limit reached "
+                f"at 0x{block_start:X}"
+            )
+            completed.append(state)
+            continue
+
+        processed_states += 1
+
+        if processed_states > max_states:
+            state.notes.append(
+                "GLOBAL STATE LIMIT REACHED"
+            )
+            completed.append(state)
+            break
+
+        block = blocks.get(
+            block_start
+        )
+
+        if block is None:
+            state.notes.append(
+                f"Missing block 0x{block_start:X}"
+            )
+            completed.append(state)
+            continue
+
+        states = [state]
+
+        step_count = 0
+
+        for insn in block.instructions:
+
+            step_count += 1
+
+            if (
+                step_count
+                > max_steps_per_state
+            ):
+                for s in states:
+                    s.notes.append(
+                        "BLOCK STEP LIMIT REACHED"
+                    )
+
+                break
+
+            new_states = []
+
+            for current_state in states:
+
+                generated = (
+                    execute_symbolic_instruction(
+                        current_state,
+                        insn,
+                    )
+                )
+
+                new_states.extend(
+                    generated
+                )
+
+            states = new_states
+
+        if not block.successors:
+
+            completed.extend(
+                states
+            )
+
+            continue
+
+        for current_state in states:
+
+            for successor in block.successors:
+
+                child = (
+                    current_state.clone()
+                )
+
+                child.notes.append(
+                    f"CFG edge "
+                    f"0x{block.start:X} "
+                    f"-> 0x{successor:X}"
+                )
+
+                pending.append(
+                    (
+                        successor,
+                        child,
+                    )
+                )
+
+    return completed
+
+
+def summarize_return_states(
+    states: list[SymbolicState],
+) -> list[dict]:
+
+    grouped = {}
+
+    for state in states:
+
+        rax = state.get_reg(
+            "rax"
+        )
+
+        if (
+            rax.kind
+            == SymbolKind.UNKNOWN
+        ):
+            continue
+
+        key = (
+            str(rax),
+            rax.origin
+        )
+
+        if key not in grouped:
+            grouped[key] = {
+                "rax": key,
+                "count": 0,
+                "example_path_tail": [
+                    f"0x{x:X}"
+                    for x
+                    in state.path[-20:]
+                ],
+                "example_notes_tail":
+                    state.notes[-20:],
+                "origin": (
+                    f"0x{rax.origin:X}"
+                    if rax.origin is not None
+                    else None
+                ),
+            }
+
+        grouped[key]["count"] += 1
+
+    return list(
+        grouped.values()
+    )
+
+@function_tool
+def analyze_symbolic_returns(
+    relative_path: str,
+    start_rva: int,
+    max_bytes: int = 4096,
+    max_states: int = 500,
+) -> str:
+    """
+    Perform lightweight path-sensitive symbolic analysis
+    and summarize possible RAX return values.
+    """
+
+    cfg = build_cfg_internal(
+        relative_path,
+        start_rva,
+        max_bytes,
+    )
+
+    states = run_symbolic_cfg(
+        cfg,
+        max_states=max_states,
+    )
+
+    summaries = summarize_return_states(
+        states
+    )
+
+    import json
+
+    return json.dumps(
+        {
+            "function": (
+                f"0x{start_rva:X}"
+            ),
+            "completed_states": (
+                len(states)
+            ),
+            "return_states": summaries,
+        },
+        indent=2,
+    )
+
+
+def summarize_efi_error_returns(
+    states: list[SymbolicState],
+) -> list[dict]:
+
+    matching = []
+
+    for state in states:
+
+        rax = state.get_reg(
+            "rax"
+        )
+
+        if (
+            rax.kind
+            != SymbolKind.EFI_DEVICE_ERROR
+        ):
+            continue
+
+        matching.append(state)
+
+    if not matching:
+        return []
+
+    examples = []
+
+    seen_tails = set()
+
+    for state in matching:
+
+        tail = tuple(
+            state.path[-20:]
+        )
+
+        if tail in seen_tails:
+            continue
+
+        seen_tails.add(tail)
+
+        examples.append({
+            "path_tail": [
+                f"0x{x:X}"
+                for x in tail
+            ],
+
+            "notes_tail":
+                state.notes[-20:],
+        })
+
+        if len(examples) >= 5:
+            break
+
+    return [{
+        "return": "EFI_DEVICE_ERROR",
+        "state_count": len(matching),
+        "example_paths": examples,
+    }]
+
+
+def summarize_call_derived_returns(
+    states: list[SymbolicState],
+) -> list[dict]:
+
+    grouped = {}
+
+    for state in states:
+
+        rax = state.get_reg(
+            "rax"
+        )
+
+        if (
+            rax.kind
+            != SymbolKind.FROM_CALL
+        ):
+            continue
+
+        key = str(rax)
+
+        if key not in grouped:
+            grouped[key] = {
+                "return": key,
+                "count": 0,
+                "example_path_tail": [
+                    f"0x{x:X}"
+                    for x
+                    in state.path[-30:]
+                ],
+                "example_notes_tail":
+                    state.notes[-30:],
+            }
+
+        grouped[key]["count"] += 1
+
+    return list(
+        grouped.values()
+    )
+
+
+STACK_SLOT_RE = re.compile(
+    r"^(?:qword ptr |dword ptr |word ptr |byte ptr )?"
+    r"\[rsp(?: \+ (0x[0-9a-f]+|\d+))?\]$"
+)
+
+
+def normalize_stack_slot(
+    operand: str,
+) -> str | None:
+
+    operand = operand.lower().strip()
+
+    match = STACK_SLOT_RE.match(
+        operand
+    )
+
+    if not match:
+        return None
+
+    offset_text = match.group(1)
+
+    if offset_text is None:
+        offset = 0
+    else:
+        offset = int(
+            offset_text,
+            0,
+        )
+
+    return f"rsp+0x{offset:X}"

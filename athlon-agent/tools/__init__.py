@@ -22,6 +22,10 @@ from .disassembly import (
     find_call_status_checks,
 )
 
+from .cfg import (
+    analyze_symbolic_returns,
+)
+
 ALL_TOOLS = [
     list_files,
     read_text_file,
@@ -38,4 +42,6 @@ ALL_TOOLS = [
     find_call_status_checks,
 
     run_project_script,
+    
+    analyze_symbolic_returns,
 ]
