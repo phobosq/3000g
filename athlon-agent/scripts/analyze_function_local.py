@@ -18,6 +18,7 @@ from tools.cfg import (
     EFI_DEVICE_ERROR,
     run_symbolic_cfg,
     summarize_return_states,
+    summarize_unknown_returns,
 )
 
 
@@ -286,6 +287,10 @@ def main():
             ),
         "call_derived_return_paths":
             summarize_call_derived_returns(
+                symbolic_states
+            ),
+        "unknown_return_analysis":
+            summarize_unknown_returns(
                 symbolic_states
             ),
     }

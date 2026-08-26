@@ -24,6 +24,14 @@ from agents import function_tool
 
 from .common import safe_path
 
+CMOV_CONDITIONS = {
+    "cmove": "e",
+    "cmovz": "z",
+
+    "cmovne": "ne",
+    "cmovnz": "nz",
+}
+
 
 class SymbolKind(str, Enum):
     UNKNOWN = "UNKNOWN"
@@ -71,10 +79,32 @@ class InstructionInfo:
 @dataclass
 class BasicBlock:
     start: int
-    instructions: list[InstructionInfo] = field(default_factory=list)
-    successors: list[int] = field(default_factory=list)
+
+    instructions: list[
+        InstructionInfo
+    ] = field(
+        default_factory=list
+    )
+
+    successors: list[int] = field(
+        default_factory=list
+    )
+
     terminal_reason: str = ""
 
+    edges: list[
+        CFGEdge
+    ] = field(
+        default_factory=list
+    )
+
+
+@dataclass
+class CFGEdge:
+    target: int
+    kind: str
+    condition_code: str | None = None
+    
 
 @dataclass
 class SymbolicState:
@@ -88,7 +118,7 @@ class SymbolicState:
         SymbolicValue
     ] = field(default_factory=dict)
 
-    flags_source: str | None = None
+    flags_source: FlagSource | None = None
 
     path: list[int] = field(
         default_factory=list
@@ -105,10 +135,17 @@ class SymbolicState:
         default_factory=dict
     )
 
+    conditions: list[str] = field(
+        default_factory=list
+    )
+
     def clone(self):
         return deepcopy(self)
 
-    def get_reg(self, reg: str) -> SymbolicValue:
+    def get_reg(
+        self,
+        reg: str,
+    ) -> SymbolicValue:
         return self.registers.get(
             canonical_register(reg),
             UNKNOWN,
@@ -124,6 +161,20 @@ class SymbolicState:
         ] = value
 
 
+@dataclass(frozen=True)
+class FlagSource:
+    address: int
+    mnemonic: str
+    operands: str
+
+    def __str__(self):
+        return (
+            f"0x{self.address:X}: "
+            f"{self.mnemonic} "
+            f"{self.operands}"
+        )
+
+        
 REGISTER_ALIASES = {
     "rax": "rax",
     "eax": "rax",
@@ -178,6 +229,78 @@ REGISTER_ALIASES = {
     "r15d": "r15",
     "r15w": "r15",
     "r15b": "r15",
+
+    "rbp": "rbp",
+    "ebp": "rbp",
+    "bp": "rbp",
+    "bpl": "rbp",
+
+    "rsp": "rsp",
+    "esp": "rsp",
+    "sp": "rsp",
+    "spl": "rsp",
+}
+
+
+JCC_CONDITIONS = {
+    "je": "e",
+    "jz": "z",
+
+    "jne": "ne",
+    "jnz": "nz",
+
+    "js": "s",
+    "jns": "ns",
+
+    "jb": "b",
+    "jc": "b",
+    "jnae": "b",
+
+    "jae": "ae",
+    "jnb": "ae",
+    "jnc": "ae",
+
+    "jbe": "be",
+    "jna": "be",
+
+    "ja": "a",
+    "jnbe": "a",
+
+    "jl": "l",
+    "jnge": "l",
+
+    "jge": "ge",
+    "jnl": "ge",
+
+    "jle": "le",
+    "jng": "le",
+
+    "jg": "g",
+    "jnle": "g",
+}
+
+
+OPPOSITE_CONDITION = {
+    "e": "ne",
+    "z": "nz",
+
+    "ne": "e",
+    "nz": "z",
+
+    "s": "ns",
+    "ns": "s",
+
+    "b": "ae",
+    "ae": "b",
+
+    "be": "a",
+    "a": "be",
+
+    "l": "ge",
+    "ge": "l",
+
+    "le": "g",
+    "g": "le",
 }
 
 
@@ -440,12 +563,253 @@ def apply_flag_instruction(
     insn: InstructionInfo,
 ):
 
-    state.flags_source = (
-        f"0x{insn.address:X}: "
-        f"{insn.mnemonic} "
-        f"{insn.op_str}"
+    state.flags_source = FlagSource(
+        address=insn.address,
+        mnemonic=insn.mnemonic.lower(),
+        operands=insn.op_str.lower(),
     )
 
+
+def normalize_conditions(
+    conditions: list[str],
+) -> tuple[str, ...]:
+
+    return tuple(
+        sorted(
+            set(conditions)
+        )
+    )
+
+
+def add_condition(
+    state: SymbolicState,
+    condition: str | None,
+):
+
+    if condition is None:
+        return
+
+    if condition not in state.conditions:
+        state.conditions.append(
+            condition
+        )
+
+
+def condition_from_flags(
+    flags: FlagSource | None,
+    condition: str,
+) -> str | None:
+
+    if flags is None:
+        return None
+
+    mnemonic = flags.mnemonic
+    operands = split_operands(
+        flags.operands
+    )
+
+    condition = condition.lower()
+
+    # ---------------------------------------
+    # test reg, immediate
+    # ---------------------------------------
+
+    if (
+        mnemonic == "test"
+        and len(operands) == 2
+    ):
+        reg = operands[0]
+        imm = parse_immediate(
+            operands[1]
+        )
+
+        if (
+            is_register_operand(reg)
+            and imm is not None
+        ):
+            reg = reg.upper()
+
+            if condition in {
+                "e",
+                "z",
+            }:
+                return (
+                    f"({reg} & 0x{imm:X}) == 0"
+                )
+
+            if condition in {
+                "ne",
+                "nz",
+            }:
+                return (
+                    f"({reg} & 0x{imm:X}) != 0"
+                )
+
+    # ---------------------------------------
+    # test reg, reg
+    #
+    # Useful for:
+    #
+    #   test rax, rax
+    #   js ...
+    #
+    # ---------------------------------------
+
+    if (
+        mnemonic == "test"
+        and len(operands) == 2
+        and operands[0] == operands[1]
+        and is_register_operand(
+            operands[0]
+        )
+    ):
+        reg = operands[0].upper()
+
+        if condition in {
+            "e",
+            "z",
+        }:
+            return (
+                f"{reg} == 0"
+            )
+
+        if condition in {
+            "ne",
+            "nz",
+        }:
+            return (
+                f"{reg} != 0"
+            )
+
+        if condition == "s":
+            return (
+                f"{reg} < 0 (signed)"
+            )
+
+        if condition == "ns":
+            return (
+                f"{reg} >= 0 (signed)"
+            )
+
+    # ---------------------------------------
+    # cmp reg, immediate
+    # ---------------------------------------
+
+    if (
+        mnemonic == "cmp"
+        and len(operands) == 2
+    ):
+        reg = operands[0]
+        imm = parse_immediate(
+            operands[1]
+        )
+
+        if (
+            is_register_operand(reg)
+            and imm is not None
+        ):
+            reg = reg.upper()
+
+            if condition in {
+                "e",
+                "z",
+            }:
+                return (
+                    f"{reg} == 0x{imm:X}"
+                )
+
+            if condition in {
+                "ne",
+                "nz",
+            }:
+                return (
+                    f"{reg} != 0x{imm:X}"
+                )
+
+            if condition == "b":
+                return (
+                    f"{reg} < 0x{imm:X} "
+                    f"(unsigned)"
+                )
+
+            if condition == "ae":
+                return (
+                    f"{reg} >= 0x{imm:X} "
+                    f"(unsigned)"
+                )
+
+    return None
+
+def negate_condition(
+    condition: str,
+) -> str | None:
+
+    if " == " in condition:
+        return condition.replace(
+            " == ",
+            " != ",
+            1,
+        )
+
+    if " != " in condition:
+        return condition.replace(
+            " != ",
+            " == ",
+            1,
+        )
+
+    if " < " in condition:
+        return condition.replace(
+            " < ",
+            " >= ",
+            1,
+        )
+
+    if " >= " in condition:
+        return condition.replace(
+            " >= ",
+            " < ",
+            1,
+        )
+
+    if " > " in condition:
+        return condition.replace(
+            " > ",
+            " <= ",
+            1,
+        )
+
+    if " <= " in condition:
+        return condition.replace(
+            " <= ",
+            " > ",
+            1,
+        )
+
+    return None
+
+
+def conditions_contradict(
+    conditions: list[str],
+) -> bool:
+
+    condition_set = set(
+        conditions
+    )
+
+    for condition in condition_set:
+
+        opposite = negate_condition(
+            condition
+        )
+
+        if (
+            opposite is not None
+            and opposite in condition_set
+        ):
+            return True
+
+    return False
 
 def apply_cmov(
     state: SymbolicState,
@@ -467,29 +831,90 @@ def apply_cmov(
     ):
         return [state]
 
-    # Branch A: cmov not taken
+    mnemonic = insn.mnemonic.lower()
+
+    condition_code = (
+        CMOV_CONDITIONS.get(
+            mnemonic
+        )
+    )
+
+    # Taken condition.
+    taken_condition = (
+        condition_from_flags(
+            state.flags_source,
+            condition_code,
+        )
+        if condition_code
+        else None
+    )
+
+    # Opposite condition.
+    opposite = {
+        "e": "ne",
+        "z": "nz",
+        "ne": "e",
+        "nz": "z",
+    }.get(
+        condition_code
+    )
+
+    not_taken_condition = (
+        condition_from_flags(
+            state.flags_source,
+            opposite,
+        )
+        if opposite
+        else None
+    )
+
+    # ---------------------------------------
+    # Not taken
+    # ---------------------------------------
+
     not_taken = state.clone()
+
+    add_condition(
+        not_taken,
+        not_taken_condition,
+    )
 
     not_taken.notes.append(
         f"0x{insn.address:X}: "
-        f"{insn.mnemonic} NOT taken; "
-        f"flags from {state.flags_source}"
+        f"{mnemonic} NOT taken; "
+        f"condition="
+        f"{not_taken_condition or 'unknown'}; "
+        f"flags from "
+        f"{state.flags_source}"
     )
 
-    # Branch B: cmov taken
+    # ---------------------------------------
+    # Taken
+    # ---------------------------------------
+
     taken = state.clone()
+
+    value = taken.get_reg(src)
 
     taken.set_reg(
         dst,
-        taken.get_reg(src),
+        value,
+    )
+
+    add_condition(
+        taken,
+        taken_condition,
     )
 
     taken.notes.append(
         f"0x{insn.address:X}: "
-        f"{insn.mnemonic} taken: "
-        f"{canonical_register(dst)} <- "
-        f"{taken.get_reg(src)}; "
-        f"flags from {state.flags_source}"
+        f"{mnemonic} taken: "
+        f"{canonical_register(dst)} "
+        f"<- {value}; "
+        f"condition="
+        f"{taken_condition or 'unknown'}; "
+        f"flags from "
+        f"{state.flags_source}"
     )
 
     return [
@@ -789,6 +1214,14 @@ def build_cfg_internal(
                         insn.target
                     )
 
+                    block.edges.append(
+                        CFGEdge(
+                            target=insn.target,
+                            kind="unconditional",
+                            condition_code=None,
+                        )
+                    )
+
                     if (
                         min_rva
                         <= insn.target
@@ -816,6 +1249,18 @@ def build_cfg_internal(
                         insn.target
                     )
 
+                    condition_code = JCC_CONDITIONS.get(
+                        insn.mnemonic.lower()  
+                    )
+
+                    block.edges.append(
+                        CFGEdge(
+                            target=insn.target,
+                            kind="branch_taken",
+                            condition_code=condition_code,
+                        )
+                    )
+
                     if (
                         min_rva
                         <= insn.target
@@ -827,6 +1272,20 @@ def build_cfg_internal(
 
                 block.successors.append(
                     next_rva
+                )
+
+                block.edges.append(
+                    CFGEdge(
+                        target=next_rva,
+                        kind="fallthrough",
+                        condition_code=(
+                            OPPOSITE_CONDITION.get(
+                                condition_code
+                            )
+                            if condition_code
+                            else None
+                        ),
+                    )
                 )
 
                 if (
@@ -919,6 +1378,13 @@ def normalize_blocks(
                     ],
                     terminal_reason=
                     "split_fallthrough",
+                    edges=[
+                        CFGEdge(
+                            target=insn.address,
+                            kind="fallthrough",
+                            condition_code=None,
+                        )
+                    ],
                 )
 
                 result[
@@ -939,9 +1405,11 @@ def normalize_blocks(
                 instructions=
                 current_instructions,
                 successors=
-                block.successors,
+                list(block.successors),
                 terminal_reason=
                 block.terminal_reason,
+                edges=
+                list(block.edges),
             )
 
             result[
@@ -1817,6 +2285,7 @@ def symbolic_state_key(
             (
                 reg,
                 str(value),
+                value.origin,
             )
             for reg, value
             in state.registers.items()
@@ -1828,19 +2297,24 @@ def symbolic_state_key(
             (
                 slot,
                 str(value),
+                value.origin,
             )
             for slot, value
             in state.stack_slots.items()
         )
     )
 
+    conditions = normalize_conditions(
+        state.conditions
+    )
+
     return (
         block_start,
         registers,
         stack_slots,
-        state.flags_source,
+        str(state.flags_source),
+        conditions,
     )
-
 
 def run_symbolic_cfg(
     cfg: dict,
@@ -1862,6 +2336,7 @@ def run_symbolic_cfg(
     ]
 
     completed = []
+    truncated = []
     processed_states = 0
     seen_states = set()
 
@@ -1898,7 +2373,7 @@ def run_symbolic_cfg(
                 f"Loop visit limit reached "
                 f"at 0x{block_start:X}"
             )
-            completed.append(state)
+            truncated.append(state)
             continue
 
         processed_states += 1
@@ -1907,7 +2382,7 @@ def run_symbolic_cfg(
             state.notes.append(
                 "GLOBAL STATE LIMIT REACHED"
             )
-            completed.append(state)
+            truncated.append(state)
             break
 
         block = blocks.get(
@@ -1951,13 +2426,42 @@ def run_symbolic_cfg(
                     )
                 )
 
-                new_states.extend(
-                    generated
-                )
+                for candidate in generated:
+
+                    candidate.conditions = list(
+                        normalize_conditions(
+                            candidate.conditions
+                        )
+                    )
+
+                    if conditions_contradict(
+                        candidate.conditions
+                    ):
+                        continue
+
+                    new_states.append(
+                        candidate
+                    )
 
             states = new_states
 
-        if not block.successors:
+        # No outgoing CFG edge means this path
+        # terminates here.
+        #
+        # Prefer explicit edge metadata, but keep
+        # successors as a compatibility fallback.
+        has_edges = bool(
+            getattr(
+                block,
+                "edges",
+                None,
+            )
+        )
+
+        if (
+            not has_edges
+            and not block.successors
+        ):
 
             completed.extend(
                 states
@@ -1965,23 +2469,87 @@ def run_symbolic_cfg(
 
             continue
 
+        # Prefer condition-aware CFGEdge metadata.
+        #
+        # Older/legacy blocks may still only have
+        # successors, so synthesize neutral edges
+        # in that case.
+        if has_edges:
+
+            edges = block.edges
+
+        else:
+
+            edges = [
+                CFGEdge(
+                    target=successor,
+                    kind="legacy",
+                    condition_code=None,
+                )
+                for successor
+                in block.successors
+            ]
+
         for current_state in states:
 
-            for successor in block.successors:
+            for edge in edges:
 
                 child = (
                     current_state.clone()
                 )
 
+                # Apply branch predicate derived
+                # from the current flags producer.
+                if (
+                    edge.condition_code
+                    is not None
+                ):
+
+                    condition = (
+                        condition_from_flags(
+                            child.flags_source,
+                            edge.condition_code,
+                        )
+                    )
+
+                    if condition is not None:
+
+                        add_condition(
+                            child,
+                            condition,
+                        )
+
+                        child.conditions = list(
+                            normalize_conditions(
+                                child.conditions
+                            )
+                        )
+
+                        if conditions_contradict(
+                            child.conditions
+                        ):
+                            continue
+
+                    else:
+
+                        child.notes.append(
+                            f"CFG edge condition "
+                            f"unknown: "
+                            f"{edge.condition_code}"
+                        )
+
                 child.notes.append(
                     f"CFG edge "
                     f"0x{block.start:X} "
-                    f"-> 0x{successor:X}"
+                    f"-> 0x{edge.target:X}; "
+                    f"kind={edge.kind}; "
+                    f"condition="
+                    f"{edge.condition_code or 'none'}"
                 )
 
                 pending.append(
                     (
-                        successor,
+                        edge.target,
                         child,
                     )
                 )
@@ -2007,27 +2575,40 @@ def summarize_return_states(
         ):
             continue
 
+        condition_key = normalize_conditions(
+            state.conditions
+        )
+
         key = (
             str(rax),
-            rax.origin
+            rax.origin,
+            condition_key,
         )
 
         if key not in grouped:
             grouped[key] = {
-                "rax": key,
-                "count": 0,
-                "example_path_tail": [
-                    f"0x{x:X}"
-                    for x
-                    in state.path[-20:]
-                ],
-                "example_notes_tail":
-                    state.notes[-20:],
+                "rax": str(rax),
+
                 "origin": (
                     f"0x{rax.origin:X}"
                     if rax.origin is not None
                     else None
                 ),
+
+                "count": 0,
+
+                "conditions": list(
+                    condition_key
+                ),
+
+                "example_path_tail": [
+                    f"0x{x:X}"
+                    for x
+                    in state.path[-20:]
+                ],
+
+                "example_notes_tail":
+                    state.notes[-20:],
             }
 
         grouped[key]["count"] += 1
@@ -2155,11 +2736,24 @@ def summarize_call_derived_returns(
         ):
             continue
 
-        key = str(rax)
+        condition_key = normalize_conditions(
+            state.conditions
+        )
+
+        key = (
+            str(rax),
+            rax.origin,
+            condition_key,
+        )
 
         if key not in grouped:
             grouped[key] = {
-                "return": key,
+                "return": str(rax),
+                "origin": (
+                    f"0x{rax.origin:X}"
+                    if rax.origin is not None
+                    else None
+                ),
                 "count": 0,
                 "example_path_tail": [
                     f"0x{x:X}"
@@ -2168,6 +2762,9 @@ def summarize_call_derived_returns(
                 ],
                 "example_notes_tail":
                     state.notes[-30:],
+                "conditions": list(
+                  condition_key
+                ),
             }
 
         grouped[key]["count"] += 1
@@ -2207,3 +2804,49 @@ def normalize_stack_slot(
         )
 
     return f"rsp+0x{offset:X}"
+
+
+def summarize_unknown_returns(
+    states: list[SymbolicState],
+    max_examples: int = 5,
+) -> dict:
+
+    matching = []
+
+    for state in states:
+
+        rax = state.get_reg(
+            "rax"
+        )
+
+        if (
+            rax.kind
+            != SymbolKind.UNKNOWN
+        ):
+            continue
+
+        matching.append(state)
+
+    examples = []
+
+    for state in matching[:max_examples]:
+
+        examples.append({
+            "conditions": list(
+                state.conditions
+            ),
+
+            "path_tail": [
+                f"0x{x:X}"
+                for x
+                in state.path[-20:]
+            ],
+
+            "notes_tail":
+                state.notes[-20:],
+        })
+
+    return {
+        "count": len(matching),
+        "examples": examples,
+    }
