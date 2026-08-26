@@ -139,6 +139,10 @@ class SymbolicState:
         default_factory=list
     )
 
+    path_conditions: list[str] = field(
+        default_factory=list
+    )
+
     def clone(self):
         return deepcopy(self)
 
@@ -156,8 +160,18 @@ class SymbolicState:
         reg: str,
         value: SymbolicValue,
     ):
+
+        canonical = canonical_register(
+            reg
+        )
+
+        invalidate_conditions_for_register(
+            self,
+            canonical,
+        )
+
         self.registers[
-            canonical_register(reg)
+            canonical
         ] = value
 
 
@@ -239,6 +253,26 @@ REGISTER_ALIASES = {
     "esp": "rsp",
     "sp": "rsp",
     "spl": "rsp",
+
+    "r8": "r8",
+    "r8d": "r8",
+    "r8w": "r8",
+    "r8b": "r8",
+
+    "r9": "r9",
+    "r9d": "r9",
+    "r9w": "r9",
+    "r9b": "r9",
+
+    "r10": "r10",
+    "r10d": "r10",
+    "r10w": "r10",
+    "r10b": "r10",
+
+    "r11": "r11",
+    "r11d": "r11",
+    "r11w": "r11",
+    "r11b": "r11",    
 }
 
 
@@ -311,6 +345,52 @@ def canonical_register(
         register.lower(),
         register.lower(),
     )
+
+
+def condition_registers(
+    condition: str,
+) -> set[str]:
+
+    tokens = re.findall(
+        r"\b[a-zA-Z][a-zA-Z0-9]*\b",
+        condition,
+    )
+
+    result = set()
+
+    for token in tokens:
+
+        token = token.lower()
+
+        if token not in REGISTER_ALIASES:
+            continue
+
+        result.add(
+            canonical_register(token)
+        )
+
+    return result
+
+
+def invalidate_conditions_for_register(
+    state: SymbolicState,
+    register: str,
+):
+
+    register = canonical_register(
+        register
+    )
+
+    state.conditions = [
+        condition
+        for condition in state.conditions
+        if (
+            register
+            not in condition_registers(
+                condition
+            )
+        )
+    ]
 
 
 def split_operands(
@@ -531,6 +611,30 @@ def apply_call(
     insn: InstructionInfo,
 ):
 
+    # UEFI x64 follows the Microsoft x64 ABI.
+    #
+    # These general-purpose registers are volatile
+    # across a call. Their previous symbolic values
+    # and path constraints are no longer valid.
+    for register in (
+        "rcx",
+        "rdx",
+        "r8",
+        "r9",
+        "r10",
+        "r11",
+    ):
+        state.set_reg(
+            register,
+            UNKNOWN,
+        )
+
+    # A call also destroys our knowledge about
+    # condition flags. Do not allow a later Jcc
+    # to accidentally reuse flags from a cmp/test
+    # performed before the call.
+    state.flags_source = None
+
     if insn.target is not None:
 
         value = SymbolicValue(
@@ -547,6 +651,8 @@ def apply_call(
             origin=insn.address,
         )
 
+    # set_reg() also invalidates any constraint
+    # referring to the previous RAX value.
     state.set_reg(
         "rax",
         value,
@@ -589,11 +695,25 @@ def add_condition(
     if condition is None:
         return
 
+    # Live symbolic constraints.
+    #
+    # These may later be invalidated when the
+    # register they depend on receives a new value.
     if condition not in state.conditions:
         state.conditions.append(
             condition
         )
 
+    # Historical path predicates.
+    #
+    # These describe WHY execution reached the
+    # current path. They are never invalidated by
+    # later register writes.
+    if condition not in state.path_conditions:
+        state.path_conditions.append(
+            condition
+        )
+        
 
 def condition_from_flags(
     flags: FlagSource | None,
@@ -2579,6 +2699,10 @@ def summarize_return_states(
             state.conditions
         )
 
+        path_condition_key = normalize_conditions(
+            state.path_conditions
+        )
+
         key = (
             str(rax),
             rax.origin,
@@ -2601,6 +2725,12 @@ def summarize_return_states(
                     condition_key
                 ),
 
+                "path_condition_sets": [
+                    list(
+                        path_condition_key
+                    )
+                ],
+
                 "example_path_tail": [
                     f"0x{x:X}"
                     for x
@@ -2610,6 +2740,22 @@ def summarize_return_states(
                 "example_notes_tail":
                     state.notes[-20:],
             }
+
+        path_conditions = list(
+            path_condition_key
+        )
+
+        if (
+            path_conditions
+            not in grouped[key][
+                "path_condition_sets"
+            ]
+        ):
+            grouped[key][
+                "path_condition_sets"
+            ].append(
+                path_conditions
+            )
 
         grouped[key]["count"] += 1
 
