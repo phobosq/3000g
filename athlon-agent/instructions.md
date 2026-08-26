@@ -109,3 +109,31 @@ Never assume that RVA equals raw file offset.
 Even if they happen to be numerically equal for a specific PE image,
 always use PE section mapping / get_offset_from_rva() when reading or
 patching bytes.
+
+## Cost-aware tool policy
+
+Prefer local structured analysis over sending raw disassembly
+to the language model.
+
+When a local JSON or CFG report exists:
+
+1. read the structured report first,
+2. identify the smallest unresolved region,
+3. request raw disassembly only for that region.
+
+Do not request or analyze large raw binary/disassembly ranges
+when local tooling can summarize them first.
+
+Use the language model primarily for:
+- interpretation,
+- hypothesis selection,
+- experiment design,
+- cross-function reasoning.
+
+Use local tools primarily for:
+- decoding,
+- CFG reconstruction,
+- call enumeration,
+- immediate searches,
+- mechanical classification,
+- simple dataflow.
